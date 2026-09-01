@@ -95,7 +95,7 @@ for (ok in available) {
     message("  no sesp rows; the per-site heterogeneity check will be skipped")
   }
 
-  source(here::here("run_pooled_analysis", "04_meta_body.R"), local = FALSE)
+  source(here::here("for_pooled_analysis", "04_meta_body.R"), local = FALSE)
 
   harvested = list()
 
