@@ -4,7 +4,7 @@
 # script consumed. Each block discharges a specific reviewer response.
 #
 #   S1  first-ward-observation score distributions          R06
-#   S2  hospital type and hospital count                    R08, R18
+#   S2  eTable 1: health systems, hospitals, types          R08, R18
 #   S3  admission diagnoses by chapter and code stem        R09
 #   S4  number needed to evaluate, lead time, crossing      R25
 #   S5  monitoring intensity and component missingness      R30
@@ -31,7 +31,7 @@ sup_path = function(stem) {
   }
 }
 
-save_supplement = function(dt, stem, label) {
+save_supplement = function(dt, stem, label, footnote = NULL) {
 
   if (is.null(dt) || nrow(dt) == 0) {
     message("  ", label, ": nothing to write")
@@ -39,14 +39,33 @@ save_supplement = function(dt, stem, label) {
   }
 
   ft = flextable(as.data.frame(dt)) |>
-    autofit() |>
     bold(part = "header")
+
+  if (!is.null(footnote)) {
+    ft = add_footer_lines(ft, values = footnote)
+  }
+
+  ft = autofit(ft)
 
   p = sup_path(stem)
   save_as_docx(ft, path = p)
   message("  Saved: ", p, " (", nrow(dt), " rows)")
   invisible(p)
 }
+
+## NEWS positivity footnote ----------------------------------------------------
+# Every table built from the sesp / crossclass artifacts applies the full NEWS
+# rule (aggregate >= 5 OR any single parameter scoring 3). The threshold-
+# equivalence tables in 04_meta.R sweep the aggregate score alone, so NEWS
+# operating characteristics at threshold 5 differ between the two families.
+# The same sentence is attached to both so the reader sees the reason.
+
+NEWS_RULE_FOOTNOTE = paste0(
+  "NEWS positivity applies the full published rule: aggregate score \u22655 or ",
+  "any single parameter scoring 3. The threshold-equivalence tables sweep the ",
+  "aggregate score alone and therefore report different NEWS operating ",
+  "characteristics at threshold 5."
+)
 
 have = function(nm) exists(nm) && nrow(get(nm)) > 0
 
@@ -75,6 +94,34 @@ weighted_quantile_from_counts = function(value, n, probs) {
 
 fmt_pct = function(x, digits = 1) {
   fifelse(is.na(x), "—", sprintf(paste0("%.", digits, "f%%"), 100 * x))
+}
+
+#' Drop rows from a site that still ships the round-one schema.
+#' load_from_catalog() rbinds with fill = TRUE, so a site whose artifacts predate
+#' the round-two rewrite contributes rows with NA in every new column rather than
+#' failing. Those rows would surface as a phantom "<= NA h" column and a blank
+#' crossing definition. Detect, name the sites, and drop.
+drop_round_one = function(dt, required, label) {
+
+  d = as.data.table(dt)
+
+  missing_cols = setdiff(required, names(d))
+  if (length(missing_cols) > 0L) {
+    message("  ", label, ": missing column(s) ",
+            paste(missing_cols, collapse = ", "), "; skipping")
+    return(data.table())
+  }
+
+  stale = Reduce(`|`, lapply(required, function(cc) is.na(d[[cc]])))
+
+  if (any(stale)) {
+    stale_sites = sort(unique(d$site[stale]))
+    message("  ", label, ": dropped ", sum(stale), " round-one row(s) from ",
+            paste(stale_sites, collapse = ", "),
+            " — these site(s) must re-run 03b_leadtime.R")
+  }
+
+  d[!stale]
 }
 
 # ==============================================================================
@@ -130,17 +177,208 @@ if (have("firstscore_raw")) {
 }
 
 # ==============================================================================
-# S2. HOSPITAL TYPE AND HOSPITAL COUNT  (R08, R18)
+# S2. eTABLE 1: HEALTH SYSTEMS, HOSPITALS, AND HOSPITAL TYPES  (R08, R18)
 # ==============================================================================
-# hospital_types_raw carries one row per (site, hospital_type) with n_hospitals,
-# resolved at the site by majority vote over the ADT hospital_type field. This
-# supplies the hospital-composition columns of eTable 1 and the corrected total
-# that R18 concedes. Bed counts, IRB numbers, and date ranges are not pipeline
-# outputs and are joined by hand from site_metadata.csv if that file exists.
+# eTable 1 columns, in order: Health system, Study period, Hospitals (n),
+# hospital-type composition, Hospitalizations (n), Adult inpatient beds, Adult
+# ICU beds, IRB. Three sources feed it.
+#
+# 1. site_metadata.yaml (repository root), hand-maintained. One key per site
+#    token with:
+#      health_system         display name
+#      hospital_ids          list of literal ADT hospital_id values, lowercase
+#      n_hospitals           OR a bare count, for a site whose ids are not yet
+#                            known to the coordinating center
+#      date_range, adult_inpatient_beds, adult_icu_beds, irb
+#    hospital_ids mirrors the site's config `hospital_ids` key, which
+#    01_cohort.R enforces with a stop. When a list is present it defines the
+#    hospital count; when only n_hospitals is present, that number is reported;
+#    when neither is present the observed count is reported.
+#
+# 2. leadtime_median_raw, unit == "hospital": one unit_id per hospital that
+#    contributed at least one primary-outcome event. This is the observed set,
+#    checked against the declared list or count. Undeclared observed ids are
+#    excluded and named on the console; declared-but-unobserved ids are named.
+#
+# 3. hospital_types_raw: counts by ADT hospital_type (academic / community /
+#    LTACH / unspecified). Round-two 01_cohort.R restricts this tally to the
+#    declared list after cohort pruning, so for new uploads its total equals
+#    the declared count. Uploads predating that change (hopkins) can carry a
+#    larger total; the console names the mismatch and the table reports the
+#    declared count.
+#
+# Hospitalizations (n) is the final flow row per site (flow_data_raw), i.e. the
+# analytic ED-admit cohort, matching the submitted eTable 1 definition.
 
-message("\n-- S2: hospital types and count (R08, R18) --")
+message("\n-- S2: eTable 1 (R08, R18) --")
 
 hospital_type_table = data.table()
+total_hospitals     = NA_integer_
+
+## 1. site metadata --------------------------------------------------------------
+
+meta_file = here("site_metadata.yaml")
+site_meta = data.table()
+declared  = data.table()
+
+scalar_or_na = function(x) {
+  if (is.null(x) || length(x) == 0L) NA_character_ else as.character(x[[1]])
+}
+
+if (file.exists(meta_file)) {
+
+  if (!requireNamespace("yaml", quietly = TRUE)) {
+    stop("site_metadata.yaml is present but the yaml package is not installed.",
+         call. = FALSE)
+  }
+
+  meta_list = yaml::read_yaml(meta_file)
+
+  if (!is.list(meta_list) || is.null(names(meta_list)) || any(!nzchar(names(meta_list)))) {
+    stop("site_metadata.yaml must be a mapping keyed by site token.", call. = FALSE)
+  }
+
+  site_meta = rbindlist(lapply(names(meta_list), function(s) {
+    m   = meta_list[[s]]
+    ids = m$hospital_ids
+    data.table(
+      site                 = tolower(trimws(s)),
+      health_system        = scalar_or_na(m$health_system),
+      n_declared_list      = if (is.null(ids)) NA_integer_ else length(unlist(ids)),
+      n_declared_count     = if (is.null(m$n_hospitals)) NA_integer_ else as.integer(m$n_hospitals),
+      date_range           = scalar_or_na(m$date_range),
+      adult_inpatient_beds = scalar_or_na(m$adult_inpatient_beds),
+      adult_icu_beds       = scalar_or_na(m$adult_icu_beds),
+      irb                  = scalar_or_na(m$irb)
+    )
+  }))
+
+  declared = rbindlist(lapply(names(meta_list), function(s) {
+    ids = meta_list[[s]]$hospital_ids
+    if (is.null(ids) || length(ids) == 0L) return(NULL)
+    data.table(
+      site        = tolower(trimws(s)),
+      hospital_id = tolower(trimws(as.character(unlist(ids))))
+    )
+  }))
+
+  if (nrow(declared) > 0) {
+    declared = declared[nzchar(hospital_id)]
+    dup = declared[, .N, by = .(site, hospital_id)][N > 1]
+    if (nrow(dup) > 0) {
+      stop("site_metadata.yaml lists duplicate hospital_ids for: ",
+           paste(unique(dup$site), collapse = ", "), call. = FALSE)
+    }
+  }
+
+  both = site_meta[!is.na(n_declared_list) & !is.na(n_declared_count) &
+                     n_declared_list != n_declared_count]
+  if (nrow(both) > 0) {
+    stop("site_metadata.yaml gives both hospital_ids and a different n_hospitals for: ",
+         paste(both$site, collapse = ", "), call. = FALSE)
+  }
+
+  message("  Read site_metadata.yaml: ", nrow(site_meta), " site(s); id lists for ",
+          length(unique(declared$site)), ", counts only for ",
+          site_meta[is.na(n_declared_list) & !is.na(n_declared_count), .N])
+
+} else {
+  message("  site_metadata.yaml not found at ", meta_file,
+          "; health-system names, declared hospitals, bed counts, IRB numbers, ",
+          "and date ranges left for manual entry")
+}
+
+## 2. observed hospitals and the reconciled count -------------------------------
+
+hospital_counts = data.table()
+
+if (have("leadtime_median_raw")) {
+
+  lm_units = drop_round_one(leadtime_median_raw,
+                            c("crossing_def", "unit", "unit_id", "n_events", "median_h"),
+                            "leadtime_median (hospital count)")
+
+  lm_units = lm_units[unit == "hospital"]
+  lm_units[, unit_id := tolower(trimws(as.character(unit_id)))]
+
+  observed = unique(lm_units[, .(site, hospital_id = unit_id)])
+
+  sites_seen = sort(unique(c(observed$site, site_meta$site)))
+  rows = vector("list", length(sites_seen))
+
+  for (i in seq_along(sites_seen)) {
+
+    s    = sites_seen[i]
+    obs  = sort(observed[site == s, hospital_id])
+    dec  = sort(declared[site == s, hospital_id])
+    n_ct = if (nrow(site_meta) > 0 && s %in% site_meta$site) {
+      site_meta[site == s, n_declared_count]
+    } else NA_integer_
+
+    if (length(obs) == 0L) {
+      message("  ", s, ": in site_metadata.yaml but no artifacts loaded; skipped")
+      next
+    }
+
+    if (length(dec) > 0L) {
+
+      undeclared = setdiff(obs, dec)
+      unobserved = setdiff(dec, obs)
+      if (length(undeclared) > 0L) {
+        message("  ", s, ": observed but not declared, EXCLUDED from count: ",
+                paste(undeclared, collapse = ", "))
+      }
+      if (length(unobserved) > 0L) {
+        message("  ", s, ": declared but no primary-outcome events in lead-time artifact: ",
+                paste(unobserved, collapse = ", "))
+      }
+      n_rep = length(dec)
+      src   = "declared list"
+      message("  ", s, ": ", n_rep, " hospital(s) from declared list [",
+              paste(dec, collapse = ", "), "]")
+
+    } else if (!is.na(n_ct)) {
+
+      if (length(obs) != n_ct) {
+        message("  ", s, ": declared n_hospitals = ", n_ct, " but ", length(obs),
+                " observed [", paste(obs, collapse = ", "),
+                "]; reporting the declared count. Obtain the id list from the site.")
+      }
+      n_rep = n_ct
+      src   = "declared count"
+      message("  ", s, ": ", n_rep, " hospital(s) from declared count (observed ",
+              length(obs), ")")
+
+    } else {
+
+      n_rep = length(obs)
+      src   = "observed"
+      message("  ", s, ": ", n_rep, " observed hospital(s), nothing declared [",
+              paste(obs, collapse = ", "), "]")
+    }
+
+    rows[[i]] = data.table(
+      site            = s,
+      hospitals_total = as.integer(n_rep),
+      hospitals_obs   = length(obs),
+      count_source    = src
+    )
+  }
+
+  hospital_counts = rbindlist(rows)
+
+  total_hospitals = sum(hospital_counts$hospitals_total)
+  message("  Pooled hospital count: ", total_hospitals,
+          " across ", nrow(hospital_counts), " health system(s)")
+
+} else {
+  message("  leadtime_median_raw unavailable; hospital count not computed")
+}
+
+## 3. hospital-type composition from ADT ---------------------------------------
+
+ht_wide   = data.table()
+type_cols = character(0)
 
 if (have("hospital_types_raw")) {
 
@@ -150,45 +388,104 @@ if (have("hospital_types_raw")) {
   ht_wide = dcast(ht, site ~ hospital_type, value.var = "n_hospitals", fill = 0L)
 
   type_cols = setdiff(names(ht_wide), "site")
-  ht_wide[, hospitals_total := rowSums(.SD), .SDcols = type_cols]
+  ht_wide[, hospitals_adt := rowSums(.SD), .SDcols = type_cols]
 
-  total_hospitals = sum(ht_wide$hospitals_total)
-
-  message("  Pooled hospital count: ", total_hospitals, " across ",
-          nrow(ht_wide), " health system(s)")
-  message("  By type: ",
+  message("  ADT hospital_types total: ", sum(ht_wide$hospitals_adt), "; by type: ",
           paste(type_cols, "=", colSums(ht_wide[, ..type_cols]), collapse = ", "))
 
-  ## optional hand-maintained metadata (beds, IRB, date range) ------------------
+} else {
+  message("  hospital_types_raw unavailable; type composition not available")
+}
 
-  meta_file = here("site_metadata.csv")
+## 4. hospitalizations (final analytic cohort per site) --------------------------
 
-  if (file.exists(meta_file)) {
-    site_meta = fread(meta_file)
-    ht_wide   = merge(ht_wide, site_meta, by = "site", all.x = TRUE)
-    message("  Joined site_metadata.csv")
-  } else {
-    message("  site_metadata.csv not found; bed counts, IRB numbers, and date ",
-            "ranges left for manual entry")
-    ht_wide[, `:=`(
-      adult_inpatient_beds = NA_character_,
-      adult_icu_beds       = NA_character_,
-      date_range           = NA_character_,
-      irb                  = NA_character_
-    )]
+site_hosp_n = data.table()
+
+if (exists("flow_data_raw") && nrow(flow_data_raw) > 0 && exists("FLOW_FINAL_STEP")) {
+  site_hosp_n = as.data.table(flow_data_raw)[step %like% FLOW_FINAL_STEP, .(
+    site,
+    hospitalizations = n_remaining_ca + n_remaining_no
+  )]
+} else {
+  message("  flow_data_raw / FLOW_FINAL_STEP unavailable; hospitalizations column blank")
+}
+
+## 5. assemble -----------------------------------------------------------------
+
+if (nrow(hospital_counts) > 0 || nrow(ht_wide) > 0) {
+
+  et1 = if (nrow(hospital_counts) > 0) copy(hospital_counts) else data.table(site = ht_wide$site)
+
+  if (nrow(ht_wide) > 0)     et1 = merge(et1, ht_wide,     by = "site", all.x = TRUE)
+  if (nrow(site_hosp_n) > 0) et1 = merge(et1, site_hosp_n, by = "site", all.x = TRUE)
+  if (nrow(site_meta) > 0)   et1 = merge(et1, site_meta,   by = "site", all.x = TRUE)
+
+  for (mc in c("hospitals_total", "hospitals_adt", "hospitalizations")) {
+    if (!mc %in% names(et1)) et1[, (mc) := NA_integer_]
+  }
+  for (mc in c("health_system", "date_range", "adult_inpatient_beds", "adult_icu_beds", "irb")) {
+    if (!mc %in% names(et1)) et1[, (mc) := NA_character_]
   }
 
-  ht_wide[, site_lab := toupper(site)]
-  setcolorder(ht_wide, c("site_lab", type_cols, "hospitals_total"))
-  ht_wide[, site := NULL]
+  ## QC: ADT type total versus reported count --------------------------------------
+  mismatch = et1[!is.na(hospitals_adt) & !is.na(hospitals_total) &
+                   hospitals_adt != hospitals_total]
+  if (nrow(mismatch) > 0) {
+    warning("hospital_types total differs from the reported hospital count at: ",
+            paste0(mismatch$site, " (types ", mismatch$hospitals_adt, " vs reported ",
+                   mismatch$hospitals_total, ")", collapse = "; "),
+            ". Expected only for uploads predating the round-two 01_cohort.R tally; ",
+            "otherwise the site's declared list or ADT needs correction.",
+            call. = FALSE)
+  }
 
-  hospital_type_table = ht_wide
+  et1[, health_system := fifelse(is.na(health_system), toupper(site), health_system)]
+  setorder(et1, health_system)
 
-  save_supplement(hospital_type_table, "table_s_hospital_types", "Hospital types")
+  keep_cols = c("health_system", "date_range", "hospitals_total", type_cols,
+                "hospitalizations", "adult_inpatient_beds", "adult_icu_beds", "irb")
+  keep_cols = intersect(keep_cols, names(et1))
+
+  hospital_type_table = et1[, ..keep_cols]
+
+  if ("hospitalizations" %in% names(hospital_type_table)) {
+    hospital_type_table[, hospitalizations :=
+                          fifelse(is.na(hospitalizations), "",
+                                  format_n(hospitalizations))]
+  }
+  for (cc in intersect(c("adult_inpatient_beds", "adult_icu_beds"), names(hospital_type_table))) {
+    v = suppressWarnings(as.numeric(hospital_type_table[[cc]]))
+    hospital_type_table[, (cc) := fifelse(is.na(v), "", format_n(v))]
+  }
+
+  pretty = c(
+    health_system        = "Health system",
+    date_range           = "Study period",
+    hospitals_total      = "Hospitals, n",
+    academic             = "Academic",
+    community            = "Community",
+    LTACH                = "Long-term acute care",
+    unspecified          = "Type unspecified",
+    hospitalizations     = "Hospitalizations, n",
+    adult_inpatient_beds = "Adult inpatient beds, n",
+    adult_icu_beds       = "Adult ICU beds, n",
+    irb                  = "IRB"
+  )
+  old_names = names(pretty)[names(pretty) %in% names(hospital_type_table)]
+  setnames(hospital_type_table, old = old_names, new = unname(pretty[old_names]))
+
+  save_supplement(
+    hospital_type_table, "table_s_hospital_types", "eTable 1",
+    footnote = paste0(
+      "Hospitals, n counts hospitals contributing encounters to the analytic cohort. ",
+      "Hospital type is the majority-vote classification of each hospital in the ",
+      "site's admission-discharge-transfer table. Hospitalizations, n is the final ",
+      "analytic cohort (emergency-department admissions to a ward) at each health system."
+    )
+  )
 
 } else {
-  message("  hospital_types_raw unavailable; skipping")
-  total_hospitals = NA_integer_
+  message("  Neither hospital counts nor hospital_types available; skipping eTable 1")
 }
 
 # ==============================================================================
@@ -211,12 +508,52 @@ if (have("adm_dx_chapter_raw")) {
   ch = as.data.table(adm_dx_chapter_raw)[, .(n = sum(n)), by = .(ca_01, chapter)]
   ch[, pct := n / sum(n), by = ca_01]
 
+  # ICD-10-CM chapter labels keyed on the leading letter of the code. Chapter D
+  # straddles neoplasms (D00-D49) and blood/immune disease (D50-D89); the label
+  # names both. Letters not in the map print as the bare letter.
+  ICD_CHAPTER_LABS = c(
+    A = "A: Infectious and parasitic diseases",
+    B = "B: Infectious and parasitic diseases",
+    C = "C: Malignant neoplasms",
+    D = "D: In situ, benign, or uncertain neoplasms; blood and immune disorders",
+    E = "E: Endocrine, nutritional, and metabolic diseases",
+    F = "F: Mental and behavioral disorders",
+    G = "G: Diseases of the nervous system",
+    H = "H: Diseases of the eye and ear",
+    I = "I: Diseases of the circulatory system",
+    J = "J: Diseases of the respiratory system",
+    K = "K: Diseases of the digestive system",
+    L = "L: Diseases of the skin",
+    M = "M: Musculoskeletal and connective tissue diseases",
+    N = "N: Diseases of the genitourinary system",
+    O = "O: Pregnancy, childbirth, and the puerperium",
+    P = "P: Perinatal conditions",
+    Q = "Q: Congenital malformations",
+    R = "R: Symptoms, signs, and abnormal findings",
+    S = "S: Injury",
+    T = "T: Injury, poisoning, and complications of care",
+    U = "U: Codes for special purposes (COVID-19)",
+    V = "V: External causes of morbidity",
+    W = "W: External causes of morbidity",
+    X = "X: External causes of morbidity",
+    Y = "Y: External causes of morbidity",
+    Z = "Z: Factors influencing health status"
+  )
+
+  ch[, chapter_lab := fcoalesce(unname(ICD_CHAPTER_LABS[as.character(chapter)]),
+                                as.character(chapter))]
+
   adm_chapter_table = dcast(
-    ch[, .(chapter, ca_01, cell = paste0(format_n(n), " (", fmt_pct(pct), ")"))],
-    chapter ~ ca_01,
+    ch[, .(chapter, chapter_lab, ca_01,
+           cell = paste0(format_n(n), " (", fmt_pct(pct), ")"))],
+    chapter + chapter_lab ~ ca_01,
     value.var = "cell",
     fill = "—"
   )
+
+  setorder(adm_chapter_table, chapter)
+  adm_chapter_table[, chapter := NULL]
+  setnames(adm_chapter_table, "chapter_lab", "chapter")
 
   setnames(adm_chapter_table, c("0", "1"), c("No Cancer", "Cancer"), skip_absent = TRUE)
   setnames(adm_chapter_table, "chapter", "ICD-10-CM chapter")
@@ -319,7 +656,8 @@ if (have("sesp_raw")) {
     `NNE (1/PPV)`   = fifelse(is.na(nne), "—", sprintf("%.1f", nne))
   )]
 
-  save_supplement(nne_table, "table_s_nne", "Number needed to evaluate")
+  save_supplement(nne_table, "table_s_nne", "Number needed to evaluate",
+                  footnote = NEWS_RULE_FOOTNOTE)
 
 } else {
   message("  sesp_raw unavailable; skipping NNE table")
@@ -334,34 +672,6 @@ leadtime_median_table = data.table()
 # ratio; "beyond x" is its complement. Reported alongside the alert rate, because
 # a long warning time from a score that flags most encounters is a different
 # claim from the same warning time at low positivity.
-
-#' Drop rows from a site that still ships the round-one schema.
-#' load_from_catalog() rbinds with fill = TRUE, so a site whose artifacts predate
-#' the round-two rewrite contributes rows with NA in every new column rather than
-#' failing. Those rows would surface as a phantom "<= NA h" column and a blank
-#' crossing definition. Detect, name the sites, and drop.
-drop_round_one = function(dt, required, label) {
-
-  d = as.data.table(dt)
-
-  missing_cols = setdiff(required, names(d))
-  if (length(missing_cols) > 0L) {
-    message("  ", label, ": missing column(s) ",
-            paste(missing_cols, collapse = ", "), "; skipping")
-    return(data.table())
-  }
-
-  stale = Reduce(`|`, lapply(required, function(cc) is.na(d[[cc]])))
-
-  if (any(stale)) {
-    stale_sites = sort(unique(d$site[stale]))
-    message("  ", label, ": dropped ", sum(stale), " round-one row(s) from ",
-            paste(stale_sites, collapse = ", "),
-            " — these site(s) must re-run 03b_leadtime.R")
-  }
-
-  d[!stale]
-}
 
 if (have("leadtime_raw")) {
 
@@ -392,7 +702,7 @@ if (have("leadtime_raw")) {
 
   leadtime_table = dcast(
     lt[, .(outcome_lab, def_lab, score_lab, ca_lab,
-           th = paste0("<= ", threshold_h, " h"),
+           th = paste0("\u2264 ", threshold_h, " h"),
            cell = fmt_pct(pct_within))],
     outcome_lab + def_lab + score_lab + ca_lab ~ factor(th, levels = unique(th)),
     value.var = "cell",
@@ -507,7 +817,8 @@ if (have("crossclass_raw")) {
     `Events never flagged`       = fmt_pct(pct_missed)
   )]
 
-  save_supplement(crossclass_table, "table_s_crossclass", "Threshold crossing")
+  save_supplement(crossclass_table, "table_s_crossclass", "Threshold crossing",
+                  footnote = NEWS_RULE_FOOTNOTE)
 
 } else {
   message("  crossclass_raw unavailable; skipping crossing table")
@@ -683,7 +994,8 @@ if (have("sesp_raw")) {
     `Median (range)`      = paste0(fmt_pct(md), " (", fmt_pct(lo), "-", fmt_pct(hi), ")")
   )]
 
-  save_supplement(site_range_table, "table_s_site_range", "Between-site ranges")
+  save_supplement(site_range_table, "table_s_site_range", "Between-site ranges",
+                  footnote = NEWS_RULE_FOOTNOTE)
 
 } else {
   message("  sesp_raw unavailable; skipping between-site range table")

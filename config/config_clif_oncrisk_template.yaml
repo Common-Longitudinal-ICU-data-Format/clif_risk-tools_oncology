@@ -4,3 +4,9 @@ file_type: "parquet, csv, or fst"
 site_lowercase: "choose from csv in config folder"
 time_zone: "local time zone"
 allow_sparse_o2: false
+# hospital_ids: every ADT hospital_id that contributes encounters to this study,
+# one per line, lowercase. 01_cohort.R stops if the cohort contains an id not
+# listed here, or if a listed id has no cohort encounters.
+hospital_ids:
+  - "hospital_a"
+  - "hospital_b"

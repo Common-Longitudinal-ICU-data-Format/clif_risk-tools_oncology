@@ -87,11 +87,10 @@ message("✅ Reclassified stepdown → ward in ADT")
 
 ### exclude hospitalizations carrying more than one patient_id ----------------
 # CLIF defines hospitalization_id as a key of one, so a hospitalization_id
-# appearing under two patient_id values is an electronic-health-record artifact
-# rather than a data-model feature. The known mechanism is an unidentified patient
-# admitted under a placeholder chart whose real chart is created alongside it; the
-# two merge on the source system's next refresh, but a snapshot taken before that
-# refresh carries both.
+# appearing under two patient_id values is an artifact.
+# The known mechanism is an unidentified patient admitted under a placeholder 
+# chart whose real chart is created alongside it; the two would merge on the 
+# source system's next refresh, but a snapshot taken before that refresh has both.
 #
 # Left in place the defect does not surface as duplicate rows, which is why no
 # existing guard catches it. The linkage below groups within patient_id, so one
@@ -478,57 +477,6 @@ fwrite(
   cancer_code_tally_primary,
   here(BOX_DIR, paste0("cancer_codes_primary_", site_lowercase, ".csv"))
 )
-
-### tally hospitals by type (eTable 1) ----------------------------------------
-# Reviewer 2 asked for the composition of contributing hospitals. One row per
-# hospital_type (academic / community / LTACH, from the ADT table), counting
-# distinct hospital_id values among the hospitalizations still in the cohort at
-# this point. Counts only; no hospital identifiers leave the site.
-#
-# A hospital_id can carry more than one hospital_type across its ADT rows
-# (entry errors, or rows where the field is blank). Counting distinct
-# (hospital_id, hospital_type) pairs would then count the same hospital more
-# than once. Each hospital is therefore assigned ONE type by majority vote
-# across its non-missing ADT rows, and blank types are ignored; a console
-# message reports any hospital whose rows carried conflicting types.
-
-hospital_type_rows =
-  dplyr::filter(data_list$adt, hospitalization_id %in% cohort_hids) |>
-  dplyr::select(hospital_id, hospital_type) |>
-  dplyr::collect() |>
-  fsubset(!is.na(hospital_type) & hospital_type != "")
-
-hospital_type_counts =
-  fcount(hospital_type_rows, hospital_id, hospital_type)
-
-n_conflicted =
-  fnunique(hospital_type_counts$hospital_id[
-    hospital_type_counts$hospital_id %in%
-      hospital_type_counts$hospital_id[duplicated(hospital_type_counts$hospital_id)]
-  ])
-
-if (n_conflicted > 0) {
-  message(
-    sprintf("⚠️  %d hospital_id(s) carry more than one hospital_type in ADT; resolved by majority vote.",
-            n_conflicted)
-  )
-}
-
-hospital_types =
-  roworder(hospital_type_counts, hospital_id, -N) |>
-  fgroup_by(hospital_id) |>
-  ffirst() |>
-  fungroup() |>
-  fgroup_by(hospital_type) |>
-  fsummarize(n_hospitals = fnunique(hospital_id)) |>
-  ftransform(site = site_lowercase)
-
-fwrite(
-  hospital_types,
-  here(BOX_DIR, paste0("hospital_types_", site_lowercase, ".csv"))
-)
-
-rm(hospital_type_rows, hospital_type_counts, n_conflicted, hospital_types)
 
 ### tally for inclusion flow diagram -------------------------------------------
 
@@ -1308,10 +1256,15 @@ rm(elix, vw); gc()
 
 ## add hospital_id -------------------------------------------------------------
 
+# hospital_id is normalized to lowercase, trimmed text before it enters the
+# cohort, so the declared-hospital check below and every downstream artifact
+# (03b lead-time units, 03a joins) see one spelling per hospital.
+
 hospital =
   dplyr::select(data_list$adt, hospitalization_id, in_dttm, hospital_id) |>
   dplyr::filter(hospitalization_id %in% cohort_hids) |>
-  dplyr::collect()
+  dplyr::collect() |>
+  fmutate(hospital_id = tolower(trimws(as.character(hospital_id))))
 
 hospital =
   join(hospital, hid_jid_crosswalk, how = "left", multiple = T) |>
@@ -1342,6 +1295,145 @@ ward_times        = fsubset(ward_times,        joined_hosp_id %in% final_jids)
 cohort_hids       = funique(hid_jid_crosswalk$hospitalization_id)
 cohort_jids       = final_jids
 rm(final_jids)
+
+## declared-hospital check ------------------------------------------------------
+# The set of hospital_id values among cohort encounters must equal the list the
+# site declared in config/config_clif_oncrisk.yaml (hospital_ids, validated in
+# 00_setup.R). Either direction stops the run:
+#   - an observed id that is not declared: a placeholder ("xxx"), a campus-level
+#     split, or a mapping error in the site's ADT extract;
+#   - a declared id with no cohort encounters: a hospital that was silently
+#     merged into another, or a typo in the list.
+# Encounters with a missing hospital_id are reported as "<missing>" and also
+# stop the run. The check runs on the pruned cohort, so ids that appear in the
+# ADT table only for encounters this study excludes (a pediatric hospital, an
+# elective-only facility) do not trip it. The site fixes hospital_id or the
+# list, then reruns from this script.
+
+hospital_id_tally =
+  fmutate(cohort, hospital_id_chk = fifelse(is.na(hospital_id) | hospital_id == "",
+                                            "<missing>", hospital_id)) |>
+  fcount(hospital_id_chk, name = "n_encounters") |>
+  roworder(-n_encounters)
+
+observed_hospital_ids  = setdiff(hospital_id_tally$hospital_id_chk, "<missing>")
+undeclared_hospital_ids = setdiff(hospital_id_tally$hospital_id_chk, hospital_ids_allowed)
+unobserved_hospital_ids = setdiff(hospital_ids_allowed, observed_hospital_ids)
+
+message(sprintf("Declared-hospital check | %d declared | %d observed among %s cohort encounters",
+                length(hospital_ids_allowed),
+                length(observed_hospital_ids),
+                format(nrow(cohort), big.mark = ",")))
+
+if (length(undeclared_hospital_ids) > 0L || length(unobserved_hospital_ids) > 0L) {
+
+  if (length(undeclared_hospital_ids) > 0L) {
+    bad = fsubset(hospital_id_tally, hospital_id_chk %in% undeclared_hospital_ids)
+    message("  Observed but NOT declared in config hospital_ids:")
+    for (i in seq_len(nrow(bad))) {
+      message(sprintf("    %-20s %s encounter(s)", bad$hospital_id_chk[i],
+                      format(bad$n_encounters[i], big.mark = ",")))
+    }
+  }
+
+  if (length(unobserved_hospital_ids) > 0L) {
+    message("  Declared in config hospital_ids but NOT observed in the cohort:")
+    for (h in unobserved_hospital_ids) message(sprintf("    %s", h))
+  }
+
+  stop(
+    paste0(
+      "Declared-hospital check failed. The hospital_id values among cohort ",
+      "encounters do not match 'hospital_ids' in config/config_clif_oncrisk.yaml ",
+      "(see the lists above). Fix hospital_id in the ADT extract or correct the ",
+      "declared list, then rerun 01_cohort.R. No artifacts were written."
+    ),
+    call. = FALSE
+  )
+}
+
+rm(hospital_id_tally, observed_hospital_ids, undeclared_hospital_ids, unobserved_hospital_ids)
+
+### tally hospitals by type (eTable 1) ----------------------------------------
+# Reviewer 2 asked for the composition of contributing hospitals. One row per
+# hospital_type (academic / community / LTACH, from the ADT table), counting
+# distinct hospital_id values among the encounters in the pruned cohort. This
+# block formerly ran before the exclusions were applied to hid_jid_crosswalk, so
+# it counted hospitals whose only encounters were later excluded and shipped a
+# total larger than the analytic cohort could support. It now runs after
+# pruning, restricted to the declared hospital list, so sum(n_hospitals) equals
+# length(hospital_ids_allowed) by construction. Counts only; no hospital
+# identifiers leave the site in this file.
+#
+# A hospital_id can carry more than one hospital_type across its ADT rows
+# (entry errors, or rows where the field is blank). Each hospital is assigned
+# ONE type by majority vote across its non-missing ADT rows. A hospital whose
+# rows are all blank is reported as "unspecified" rather than dropped, so the
+# count still reconciles; a console message names how many.
+
+hospital_type_rows =
+  dplyr::filter(data_list$adt, hospitalization_id %in% cohort_hids) |>
+  dplyr::select(hospital_id, hospital_type) |>
+  dplyr::collect() |>
+  fmutate(hospital_id = tolower(trimws(as.character(hospital_id)))) |>
+  fsubset(hospital_id %in% hospital_ids_allowed)
+
+hospital_type_counts =
+  fsubset(hospital_type_rows, !is.na(hospital_type) & hospital_type != "") |>
+  fcount(hospital_id, hospital_type)
+
+n_conflicted =
+  fnunique(hospital_type_counts$hospital_id[
+    hospital_type_counts$hospital_id %in%
+      hospital_type_counts$hospital_id[duplicated(hospital_type_counts$hospital_id)]
+  ])
+
+if (n_conflicted > 0) {
+  message(
+    sprintf("⚠️  %d hospital_id(s) carry more than one hospital_type in ADT; resolved by majority vote.",
+            n_conflicted)
+  )
+}
+
+hospital_type_resolved =
+  roworder(hospital_type_counts, hospital_id, -N) |>
+  fgroup_by(hospital_id) |>
+  ffirst() |>
+  fungroup() |>
+  fselect(hospital_id, hospital_type)
+
+hospital_type_unspecified = setdiff(hospital_ids_allowed, hospital_type_resolved$hospital_id)
+
+if (length(hospital_type_unspecified) > 0L) {
+  message(sprintf("⚠️  %d hospital_id(s) have no non-blank hospital_type in ADT; reported as 'unspecified'.",
+                  length(hospital_type_unspecified)))
+  hospital_type_resolved =
+    rbind(
+      hospital_type_resolved,
+      tidytable(hospital_id = hospital_type_unspecified, hospital_type = "unspecified")
+    )
+}
+
+hospital_types =
+  fgroup_by(hospital_type_resolved, hospital_type) |>
+  fsummarize(n_hospitals = fnunique(hospital_id)) |>
+  ftransform(site = site_lowercase)
+
+if (sum(hospital_types$n_hospitals) != length(hospital_ids_allowed)) {
+  stop(
+    sprintf("hospital_types tally (%d) does not equal the declared hospital count (%d).",
+            sum(hospital_types$n_hospitals), length(hospital_ids_allowed)),
+    call. = FALSE
+  )
+}
+
+fwrite(
+  hospital_types,
+  here(BOX_DIR, paste0("hospital_types_", site_lowercase, ".csv"))
+)
+
+rm(hospital_type_rows, hospital_type_counts, n_conflicted,
+   hospital_type_resolved, hospital_type_unspecified, hospital_types)
 
 ## merge ward intervals into disjoint blocks per encounter ---------------------
 # Up to this point ward_times holds one row per ADT ward stay, so an encounter
@@ -1442,6 +1534,7 @@ keep = c(
   "data_list",
   "site_lowercase",
   "allow_sparse_o2",
+  "hospital_ids_allowed",
   "cohort",
   "cohort_hids",
   "cohort_jids",

@@ -151,61 +151,124 @@ make_y = function(h_to_event, horizon) {
 # MIN_ESTIMABLE events OR non-events returns NA for the estimate and interval but
 # retains n_obs / n_events and is flagged estimable = FALSE, so the coordinating
 # center sees the denominators and excludes only the estimate from pooling.
-compute_site_auroc = function(dt, score_col = "value", site_lowercase, group_col = "ca_01") {
+#
+# Computed from a COUNT TABLE, not from observations. Every score in this study
+# is an integer with at most ~21 distinct values, so the DeLong placements are
+# constant within a value: for an event scoring v, its placement is
+# (non-events below v + 1/2 non-events tied at v) / N0, and symmetrically for a
+# non-event. The AUROC is the event-weighted mean placement and the DeLong
+# variance is S10/N1 + S01/N0 with S10, S01 the (n-1)-denominator weighted
+# variances of the placements across values. This is algebraically the DeLong
+# estimator that pROC::ci.auc(method = "delong") computes from observations;
+# .verify_delong_from_counts() below asserts agreement on one cell before the
+# matrix runs. The observation-level routine took minutes per cell on a
+# 20-million-row site and ran ~220 times; this runs in microseconds.
+#
+# Input: a count table with columns score_name, <group_col>, <value_col>,
+# outcome (0/1), n. Rows with NA in value_col are counted in n_obs / n_events
+# (as pROC's na.rm did for the denominators reported before) but excluded from
+# the AUROC, matching the previous behaviour exactly.
 
-  library(pROC)
+compute_site_auroc = function(counts, value_col = "value", site_lowercase, group_col = "ca_01") {
 
-  dt = as.data.table(dt)
-  combos = unique(dt[, .(score_name, .grp = get(group_col))])
+  ct = as.data.table(counts)
+  need = c("score_name", group_col, value_col, "outcome", "n")
+  miss = setdiff(need, names(ct))
+  if (length(miss)) stop("compute_site_auroc(): missing cols: ", paste(miss, collapse = ", "))
 
-  mk_row = function(sc, gval, n_obs, n_events, auroc, se, lo, hi, estimable) {
-    r = data.table(score_name = sc)
-    r[, (group_col) := gval]
-    r[, `:=`(n_obs = n_obs, n_events = n_events, auroc = auroc, auroc_se = se,
-             ci_lower = lo, ci_upper = hi, site = site_lowercase, estimable = estimable)]
-    r
-  }
+  setnames(ct, c(group_col, value_col), c("grp_", "val_"))
 
-  results = lapply(seq_len(nrow(combos)), function(i) {
+  z = qnorm(0.975)
 
-    sc = combos$score_name[i]
-    g  = combos$.grp[i]
+  delong_cell = function(val, outcome, n) {
 
-    sub = dt[score_name == sc & get(group_col) == g]
-
-    n_obs    = nrow(sub)
-    n_events = sum(sub$outcome == 1L, na.rm = TRUE)
+    n_obs    = as.integer(sum(n))
+    n_events = as.integer(sum(n[outcome == 1L]))
     n_nonev  = n_obs - n_events
 
     estimable = (n_events >= MIN_ESTIMABLE) && (n_nonev >= MIN_ESTIMABLE)
 
-    if (!estimable) {
-      return(mk_row(sc, g, n_obs, n_events, NA_real_, NA_real_, NA_real_, NA_real_, FALSE))
-    }
+    na_row = list(n_obs = n_obs, n_events = n_events,
+                  auroc = NA_real_, auroc_se = NA_real_,
+                  ci_lower = NA_real_, ci_upper = NA_real_, estimable = FALSE)
 
-    roc_obj = tryCatch(
-      roc(sub$outcome, sub[[score_col]], levels = c(0, 1), direction = "<", quiet = TRUE),
-      error = function(e) NULL
-    )
-    if (is.null(roc_obj)) {
-      return(mk_row(sc, g, n_obs, n_events, NA_real_, NA_real_, NA_real_, NA_real_, FALSE))
-    }
+    if (!estimable) return(na_row)
 
-    auc_val = as.numeric(auc(roc_obj))
-    ci_obj  = tryCatch(ci.auc(roc_obj, method = "delong"), error = function(e) NULL)
+    keep = !is.na(val)
+    val = val[keep]; outcome = outcome[keep]; n = n[keep]
 
-    if (!is.null(ci_obj)) {
-      ci_lo    = as.numeric(ci_obj[1])
-      ci_hi    = as.numeric(ci_obj[3])
-      auroc_se = (ci_hi - ci_lo) / (2 * 1.96)
-    } else {
-      ci_lo = ci_hi = auroc_se = NA_real_
-    }
+    vals = sort(unique(val))
+    n1 = vapply(vals, function(v) as.numeric(sum(n[val == v & outcome == 1L])), numeric(1))
+    n0 = vapply(vals, function(v) as.numeric(sum(n[val == v & outcome == 0L])), numeric(1))
+    N1 = sum(n1); N0 = sum(n0)
 
-    mk_row(sc, g, n_obs, n_events, auc_val, auroc_se, ci_lo, ci_hi, TRUE)
-  })
+    if (N1 < 2 || N0 < 2) return(na_row)
 
-  rbindlist(results, use.names = TRUE)
+    below0 = cumsum(n0) - n0            # non-events strictly below each value
+    above1 = N1 - cumsum(n1)            # events strictly above each value
+
+    v10 = (below0 + 0.5 * n0) / N0      # placement of an event at each value
+    v01 = (above1 + 0.5 * n1) / N1      # placement of a non-event at each value
+
+    auc = sum(n1 * v10) / N1
+
+    s10 = sum(n1 * (v10 - auc)^2) / (N1 - 1)
+    s01 = sum(n0 * (v01 - auc)^2) / (N0 - 1)
+    se  = sqrt(s10 / N1 + s01 / N0)
+
+    list(n_obs = n_obs, n_events = n_events,
+         auroc = auc, auroc_se = se,
+         ci_lower = auc - z * se, ci_upper = auc + z * se, estimable = TRUE)
+  }
+
+  out = ct[, delong_cell(val_, outcome, n), by = .(score_name, grp_)]
+  setnames(out, "grp_", group_col)
+  out[, site := site_lowercase]
+  setcolorder(out, c("score_name", group_col, "n_obs", "n_events", "auroc", "auroc_se",
+                     "ci_lower", "ci_upper", "site", "estimable"))
+  out[]
+}
+
+# self-check: count-based DeLong == pROC observation-level DeLong -----------------
+# Run once per site on the encounter-max composite / ca / main cell (ten
+# score x cohort pairs). Agreement to 1e-8 on the estimate and both bounds
+# proves the algebra above on this site's data before any artifact is written
+# with it. pROC is loaded here only.
+
+.verify_delong_from_counts = function(dt_max, site_lowercase, tol = 1e-8) {
+
+  library(pROC)
+
+  agg  = aggregate_maxscores(dt_max, site_lowercase, group_col = "ca_01")
+  fast = compute_site_auroc(agg, value_col = "max_value", site_lowercase, group_col = "ca_01")
+
+  dtm = as.data.table(dt_max)
+  combos = unique(dtm[, .(score_name, ca_01)])
+
+  slow = rbindlist(lapply(seq_len(nrow(combos)), function(i) {
+    sub = dtm[score_name == combos$score_name[i] & ca_01 == combos$ca_01[i] & !is.na(max_value)]
+    r   = roc(sub$outcome, sub$max_value, levels = c(0, 1), direction = "<", quiet = TRUE)
+    ci  = ci.auc(r, method = "delong")
+    data.table(score_name = combos$score_name[i], ca_01 = combos$ca_01[i],
+               auroc_p = as.numeric(auc(r)), lo_p = as.numeric(ci[1]), hi_p = as.numeric(ci[3]))
+  }))
+
+  cmp = merge(fast[estimable == TRUE], slow, by = c("score_name", "ca_01"))
+  if (nrow(cmp) == 0L) {
+    stop("DeLong self-check: no estimable cells to compare.", call. = FALSE)
+  }
+
+  d = max(abs(cmp$auroc - cmp$auroc_p), abs(cmp$ci_lower - cmp$lo_p), abs(cmp$ci_upper - cmp$hi_p))
+
+  if (!is.finite(d) || d > tol) {
+    print(cmp)
+    stop(sprintf("DeLong self-check FAILED: max |count-based - pROC| = %.3e exceeds %.0e.", d, tol),
+         call. = FALSE)
+  }
+
+  message(sprintf("✅ DeLong self-check passed: count-based AUROC/CI match pROC on %d cells (max diff %.1e).",
+                  nrow(cmp), d))
+  invisible(TRUE)
 }
 
 # aggregate encounter-max scores to counts, generalized over grouping column ----
@@ -453,6 +516,11 @@ materialize_variant_long = function(variant, scores, fc, outcome, stratum) {
 
 .verify_composite_reproduction(scores, fc, site_lowercase)
 
+.verify_delong_from_counts(
+  materialize_variant_max("main", scores, fc, OUTCOMES[key == "composite"], STRATA[key == "ca"]),
+  site_lowercase
+)
+
 # ==============================================================================
 # END PART 2  (Part 3: run matrix + threshold block + event tally + bootstrap)
 # ==============================================================================
@@ -497,7 +565,7 @@ emit_maxscores_auroc = function(scores, fc, variant, outcome, stratum, analysis,
   write_artifact(agg, analysis, "maxscores", site_lowercase,
                  strata = stratum$key, outcome = outcome$key, variant = vtok)
 
-  au = compute_site_auroc(dt_max, score_col = "max_value", site_lowercase, group_col = gcol)
+  au = compute_site_auroc(agg, value_col = "max_value", site_lowercase, group_col = gcol)
   au[, metric := "encounter_max"]
   write_artifact(au, analysis, "auroc", site_lowercase,
                  strata = stratum$key, outcome = outcome$key, variant = vtok)
@@ -519,9 +587,7 @@ emit_counts_auroc_horizon = function(scores, fc, variant, outcome, stratum, hori
     write_artifact(counts[h == HH], analysis, "counts", site_lowercase,
                    strata = stratum$key, outcome = outcome$key, horizon = HH, variant = vtok)
 
-    dt_h = copy(long)
-    dt_h[, outcome := make_y(h_to_event, HH)]
-    au_h = compute_site_auroc(dt_h, score_col = "value", site_lowercase, group_col = gcol)
+    au_h = compute_site_auroc(counts[h == HH], value_col = "value", site_lowercase, group_col = gcol)
     au_h[, horizon := HH]
     write_artifact(au_h, analysis, "auroc", site_lowercase,
                    strata = stratum$key, outcome = outcome$key, horizon = HH, variant = vtok)
@@ -582,32 +648,41 @@ make_firstscore_distribution = function(scores, site_lowercase) {
 run_artifact_matrix = function(scores, fc, site_lowercase) {
 
   st_ca = STRATA[key == "ca"]
+  t_row = Sys.time()
 
   # Row 1 — ca, all five outcomes, main variant
   for (k in OUTCOMES$key) {
-    oc = OUTCOMES[key == k]
+    oc = OUTCOMES[key == k]; t0 = Sys.time()
     emit_maxscores_auroc(scores, fc, "main", oc, st_ca, "main", site_lowercase)
     emit_counts_auroc_horizon(scores, fc, "main", oc, st_ca, HORIZONS, "horizon", site_lowercase)
+    message(sprintf("  row 1 | outcome=%-9s variant=main stratum=ca   | %.0f s",
+                    k, as.numeric(difftime(Sys.time(), t0, units = "secs"))))
   }
 
   # Row 2 — ca, composite only, four sensitivity variants
   oc_comp = OUTCOMES[key == "composite"]
   for (v in setdiff(VARIANTS, "main")) {
+    t0 = Sys.time()
     emit_maxscores_auroc(scores, fc, v, oc_comp, st_ca, "sensitivity", site_lowercase)
     emit_counts_auroc_horizon(scores, fc, v, oc_comp, st_ca, HORIZONS, "sensitivity", site_lowercase)
+    message(sprintf("  row 2 | outcome=composite variant=%-17s stratum=ca | %.0f s",
+                    v, as.numeric(difftime(Sys.time(), t0, units = "secs"))))
   }
 
   # Row 3 — subgroups, composite + nohospice, main variant (h24 counts only)
   for (sk in c("liquid", "mets")) {
     st = STRATA[key == sk]
     for (k in c("composite", "nohospice")) {
-      oc = OUTCOMES[key == k]
+      oc = OUTCOMES[key == k]; t0 = Sys.time()
       emit_maxscores_auroc(scores, fc, "main", oc, st, "main", site_lowercase)
       emit_counts_auroc_horizon(scores, fc, "main", oc, st, 24L, "horizon", site_lowercase)
+      message(sprintf("  row 3 | outcome=%-9s variant=main stratum=%-6s | %.0f s",
+                      k, sk, as.numeric(difftime(Sys.time(), t0, units = "secs"))))
     }
   }
 
   # Row 4 — subgroups, all five outcomes, event tally only (no AUROC)
+  t0 = Sys.time()
   for (sk in c("liquid", "mets")) {
     st = STRATA[key == sk]
     for (k in OUTCOMES$key) {
@@ -618,6 +693,11 @@ run_artifact_matrix = function(scores, fc, site_lowercase) {
       }
     }
   }
+  message(sprintf("  row 4 | event tallies (liquid, mets x 5 outcomes)        | %.0f s",
+                  as.numeric(difftime(Sys.time(), t0, units = "secs"))))
+
+  message(sprintf("  artifact matrix complete | %.1f min",
+                  as.numeric(difftime(Sys.time(), t_row, units = "mins"))))
   invisible()
 }
 

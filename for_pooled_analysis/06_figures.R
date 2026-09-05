@@ -11,7 +11,7 @@
 #   Figure 3  Efficiency curves (sensitivity vs threshold positivity, all 5 scores)
 #
 # Supplement figures (numbered in the order cited in Results):
-#   Figure S1  Flow diagram (built in 01_tables.R)
+#   Figure S1  Inclusion flow diagram (pooled counts from 01_tables.R)
 #   Figure S2  Score distributions + risk differences (2-panel combined)
 #   Figure S3  Score co-positivity (mirrored UpSet-style)
 #   Figure S4  Component contributions to score positivity (dumbbell)
@@ -19,7 +19,7 @@
 #              across integer thresholds; 5 scores x 4 measures grid)
 #   Figure S6  AUROC heterogeneity: site-level + cancer subtype (2-panel combined)
 #   Figure S7  Robustness of cancer-noncancer AUROC gap (sensitivity analyses,
-#              24h naive, and 24h clustered bootstrap, unified rows)
+#              carry-forward windows, 24h naive, and 24h bootstraps)
 # ==============================================================================
 
 # SETUP ------------------------------------------------------------------------
@@ -28,6 +28,8 @@ library(patchwork)
 library(ggplot2)
 library(scales)
 library(purrr)
+library(DiagrammeR)
+library(stringr)
 
 if (!dir.exists(here("output", "figures"))) {
   dir.create(here("output", "figures"), recursive = TRUE)
@@ -50,7 +52,7 @@ theme_ews = function(base_size = 11) {
 ## score labels ---------------------------------------------------------------
 
 score_levels = c("sirs", "qsofa", "mews", "mews_sf", "news")
-score_labels = c("SIRS", "QSOFA", "MEWS", "MEWS-SF", "NEWS")
+score_labels = c("SIRS", "qSOFA", "MEWS", "MEWS-SF", "NEWS")
 names(score_labels) = score_levels
 
 ## helper functions -----------------------------------------------------------
@@ -165,6 +167,19 @@ calc_auroc_from_counts = function(data) {
   )
 }
 
+## data-driven symmetric-ish axis limits ---------------------------------------
+# Several supplement panels previously used fixed limits that clipped confidence
+# intervals once a second site was pooled. This returns limits that cover the
+# data (including CI bounds), padded and rounded outward to a step.
+
+axis_limits_from = function(lo, hi, step = 0.02, pad = 0.01) {
+  rng = range(c(lo, hi), na.rm = TRUE)
+  c(
+    floor((rng[1] - pad) / step) * step,
+    ceiling((rng[2] + pad) / step) * step
+  )
+}
+
 # ==============================================================================
 # FIGURE 1: Calibration curves (observed deterioration rate by score value)
 # ==============================================================================
@@ -213,7 +228,7 @@ fig1_panel = function(score, show_y = TRUE, x_breaks = NULL) {
 }
 
 fig1_sirs   = fig1_panel("SIRS",    TRUE,  0:4)
-fig1_qsofa  = fig1_panel("QSOFA",   FALSE, 0:3)
+fig1_qsofa  = fig1_panel("qSOFA",   FALSE, 0:3)
 fig1_mews   = fig1_panel("MEWS",    FALSE, seq(0, 12, 2))
 fig1_mewssf = fig1_panel("MEWS-SF", TRUE,  seq(0, 12, 2))
 fig1_news   = fig1_panel("NEWS",    FALSE, seq(0, 16, 2))
@@ -382,7 +397,7 @@ fig3_panel = function(score, show_y = TRUE) {
 }
 
 fig3_sirs   = fig3_panel("SIRS",    TRUE)
-fig3_qsofa  = fig3_panel("QSOFA",   FALSE)
+fig3_qsofa  = fig3_panel("qSOFA",   FALSE)
 fig3_mews   = fig3_panel("MEWS",    FALSE)
 fig3_mewssf = fig3_panel("MEWS-SF", TRUE)
 fig3_news   = fig3_panel("NEWS",    FALSE)
@@ -410,6 +425,186 @@ fig3 = (fig3_sirs | fig3_qsofa | fig3_mews) /
 
 ggsave(here("output", "figures", "figure_03_efficiency_curves.pdf"),
        fig3, width = 12, height = 7)
+
+# ==============================================================================
+# SUPP FIGURE 1: Inclusion flow diagram
+# ==============================================================================
+#
+# Round-two flow: the starting population, four exclusion steps written by
+# 01_cohort.R, and the reconciliation step appended by 02_scores.R. Counts come
+# from the pooled object built in 01_tables.R, not from a second pass over the
+# site CSVs, so the figure and flow_pooled_<date>.csv cannot diverge.
+#
+# Step labels are normalized here rather than upstream. Sites and 01_tables.R
+# both carry legacy wordings for step 5, and the manuscript wording promised in
+# the response to Reviewer 2 (comment 19) is "clinical deterioration within 6
+# hours of ward arrival". Matching is done on distinguishing substrings so the
+# block accepts any of the three variants and always draws the revised label.
+#
+# Site-level QC of the flow (six-row structure, arithmetic identity, and
+# exclusion-percentage outliers) lives in qc.R module 3; nothing is duplicated
+# here.
+
+message("\n== Building Supp Figure 1 (inclusion flow diagram) ==")
+
+## resolve the pooled flow object ---------------------------------------------
+
+sf1_source =
+  if (exists("flow_data_final")) {
+    get("flow_data_final")
+  } else if (exists("flow_data")) {
+    get("flow_data")
+  } else {
+    stop("Pooled flow counts not found. Source 01_tables.R before 06_figures.R.",
+         call. = FALSE)
+  }
+
+sf1_data = as.data.table(sf1_source)
+
+sf1_required = c("step", "n_remaining_ca", "n_excluded_ca",
+                 "n_remaining_no", "n_excluded_no")
+
+sf1_missing = setdiff(sf1_required, names(sf1_data))
+
+if (length(sf1_missing) > 0) {
+  stop("Pooled flow object is missing columns: ",
+       paste(sf1_missing, collapse = ", "), call. = FALSE)
+}
+
+sf1_data = sf1_data[, ..sf1_required]
+
+## normalize step labels and impose chronological order -----------------------
+# One regex per step, matched against the lowercased label. Each regex must
+# match exactly one row, and all six must match, or the figure is not drawn.
+
+sf1_step_patterns = c(
+  "adult inpatient admissions",
+  "not admitted through the ed",
+  "icu before",
+  "6h data",
+  "outcomes too early|before prediction data available|clinical deterioration within 6 hours",
+  "calculable score|score calculable"
+)
+
+sf1_step_labels = c(
+  "Adult inpatient admissions during study period",
+  "After excluding patients not admitted through the ED",
+  "After excluding patients who were in the ICU before admission to the wards",
+  "After excluding encounters with < 6h data",
+  "After excluding encounters with clinical deterioration within 6 hours of ward arrival",
+  "After excluding encounters with no score calculable before the outcome"
+)
+
+sf1_data[, step_lc := str_squish(tolower(step))]
+
+sf1_match = lapply(
+  sf1_step_patterns,
+  function(p) which(str_detect(sf1_data$step_lc, p))
+)
+
+sf1_n_match = lengths(sf1_match)
+
+if (any(sf1_n_match != 1L)) {
+  print(data.table(
+    expected  = sf1_step_labels,
+    n_matched = sf1_n_match
+  ))
+  print(sf1_data$step)
+  stop("Pooled flow steps do not resolve to the expected six-row sequence.",
+       call. = FALSE)
+}
+
+sf1_idx = unlist(sf1_match)
+
+if (anyDuplicated(sf1_idx) > 0) {
+  print(sf1_data$step)
+  stop("A single flow row matched more than one expected step.", call. = FALSE)
+}
+
+sf1_data = sf1_data[sf1_idx]
+sf1_data[, step := sf1_step_labels]
+sf1_data[, step_lc := NULL]
+
+message("  Pooled flow final row: ",
+        format(sf1_data$n_remaining_ca[6], big.mark = ","), " cancer / ",
+        format(sf1_data$n_remaining_no[6], big.mark = ","), " non-cancer")
+
+## build the graphviz source ---------------------------------------------------
+
+sf1_fmt = function(x) {
+  format(x, big.mark = ",", scientific = FALSE, trim = TRUE)
+}
+
+sf1_code = paste0(
+  "digraph flowchart {
+    node [shape = box, fontname = Helvetica]
+    A [label = 'Adult inpatient admissions during study period\\nPatients with Cancer: ",
+  sf1_fmt(sf1_data$n_remaining_ca[1]),
+  "\\nPatients Without Cancer: ",
+  sf1_fmt(sf1_data$n_remaining_no[1]),
+  "']"
+)
+
+for (i in 2:nrow(sf1_data)) {
+
+  sf1_node      = LETTERS[i]
+  sf1_prev_node = LETTERS[i - 1]
+  sf1_excl_node = paste0("E", i - 1)
+  sf1_excl_lab  = gsub("After excluding ", "", sf1_data$step[i])
+
+  sf1_code = paste0(
+    sf1_code, "  ",                sf1_excl_node,
+    " [label = 'Excluded ",        sf1_excl_lab,
+    "\\nPatients With Cancer: ",   sf1_fmt(sf1_data$n_excluded_ca[i]),
+    "\\nPatients Without Cancer: ", sf1_fmt(sf1_data$n_excluded_no[i]), "']\n",
+    "  ", sf1_node, "
+    [label = 'Remaining Encounters\\nPatients With Cancer: ",
+    sf1_fmt(sf1_data$n_remaining_ca[i]),
+    "\\nPatients Without Cancer: ",
+    sf1_fmt(sf1_data$n_remaining_no[i]), "']\n",
+    "  ", sf1_prev_node, " -> ", sf1_excl_node, "\n",
+    "  ", sf1_prev_node, " -> ", sf1_node,      "\n"
+  )
+}
+
+sf1_code = paste0(sf1_code, "}")
+
+sf1 = grViz(sf1_code)
+
+## export to PDF and PNG -------------------------------------------------------
+# grViz returns an htmlwidget and writes nothing on its own, so the widget is
+# rasterized through SVG. DiagrammeRsvg and rsvg are required; rsvg needs system
+# librsvg2. If either package is unavailable the script reports it and continues
+# rather than aborting the remaining figures.
+
+sf1_have_export =
+  requireNamespace("DiagrammeRsvg", quietly = TRUE) &&
+  requireNamespace("rsvg",          quietly = TRUE)
+
+if (!sf1_have_export) {
+
+  message("  DiagrammeRsvg and/or rsvg not installed; ",
+          "Supp Figure 1 rendered to the viewer only. ",
+          "Add both to uvr.toml to write the files.")
+
+} else {
+
+  sf1_svg = DiagrammeRsvg::export_svg(sf1)
+  sf1_raw = charToRaw(sf1_svg)
+
+  rsvg::rsvg_pdf(
+    sf1_raw,
+    file = here("output", "figures", "figure_s01_flow.pdf")
+  )
+
+  rsvg::rsvg_png(
+    sf1_raw,
+    file  = here("output", "figures", "figure_s01_flow.png"),
+    width = 2400
+  )
+
+  message("  Wrote figure_s01_flow.pdf and figure_s01_flow.png")
+}
 
 # ==============================================================================
 # SUPP FIGURE 2: Score distributions + risk differences (2-panel combined)
@@ -444,12 +639,35 @@ sf2a_data = maxscores_ca_raw |>
   fmutate(
     score_lab    = format_score(score_name),
     cohort_label = format_cohort(ca_01, COHORT_N)
-  ) |>
-  fsubset(max_value <= 14)
+  )
 
 sf2a_pal = build_cohort_palette(levels(sf2a_data$cohort_label))
 
+## shared x-range per score for panels A and B (R20) -----------------------------
+# facet_wrap(scales = "free_x") sizes each facet to its own data, and panels A
+# and B draw from different objects, so their x ranges drifted apart. A
+# geom_blank layer carrying the union range per score, added to BOTH panels,
+# forces identical x limits facet by facet without fixing them by hand.
+
+sf2b_range_src = rd_wide_final |>
+  fsubset(has_both == TRUE) |>
+  fmutate(score_lab = format_score(score_name)) |>
+  fselect(score_lab, max_value)
+
+sf2_xrange = rbind(
+  as.data.table(sf2a_data)[, .(score_lab, max_value)],
+  as.data.table(sf2b_range_src)
+)[, .(x_lo = min(max_value), x_hi = max(max_value)), by = score_lab]
+
+sf2_xrange_long = melt(
+  sf2_xrange,
+  id.vars = "score_lab",
+  measure.vars = c("x_lo", "x_hi"),
+  value.name = "max_value"
+)[, .(score_lab, max_value)]
+
 sf2a = ggplot(sf2a_data, aes(x = max_value, y = n, fill = cohort_label)) +
+  geom_blank(data = sf2_xrange_long, aes(x = max_value), inherit.aes = FALSE) +
   geom_col(position = position_dodge(width = 0.45), width = 0.4) +
   facet_wrap(~score_lab, nrow = 1, scales = "free_x") +
   scale_fill_manual(values = sf2a_pal, name = "Cohort") +
@@ -488,6 +706,7 @@ sf2b_trend[, `:=`(
 )]
 
 sf2b = ggplot(sf2b_data, aes(x = max_value, y = rd)) +
+  geom_blank(data = sf2_xrange_long, aes(x = max_value), inherit.aes = FALSE) +
   geom_hline(yintercept = 0, color = "gray60", linewidth = 0.3) +
   geom_errorbar(aes(ymin = rd_lo, ymax = rd_hi), width = 0, color = "gray30") +
   geom_point(color = "black", size = 1.8) +
@@ -633,6 +852,10 @@ sf6a_all[, y_pos := as.numeric(score_label)]
 set.seed(20260421)
 sf6a_all[is_pooled == FALSE, y_pos := y_pos + runif(.N, -0.18, 0.18)]
 
+# x limits cover every site and pooled CI; the fixed +/-0.10 used earlier
+# clipped site intervals once a second site was pooled.
+sf6a_xlim = axis_limits_from(sf6a_all$ci_lower, sf6a_all$ci_upper, step = 0.05)
+
 sf6a = ggplot(sf6a_all, aes(x = diff, y = y_pos)) +
   geom_vline(xintercept = 0, color = "gray70", linetype = "dashed", linewidth = 0.4) +
   geom_errorbarh(
@@ -659,8 +882,8 @@ sf6a = ggplot(sf6a_all, aes(x = diff, y = y_pos)) +
     expand = expansion(add = 0.5)
   ) +
   scale_x_continuous(
-    limits = c(-0.10, 0.10),
-    breaks = seq(-0.10, 0.10, 0.05),
+    limits = sf6a_xlim,
+    breaks = seq(sf6a_xlim[1], sf6a_xlim[2], 0.05),
     labels = function(x) sprintf("%+.2f", x)
   ) +
   labs(x = "AUROC difference (cancer - non-cancer)", y = NULL) +
@@ -721,7 +944,10 @@ sf6b_pal = c("Non-Cancer" = "#4575b4", "Solid" = "#f4a582", "Hematologic" = "#d7
 
 # Faceted by score with coord_flip, to mirror Panel A's layout. Each facet
 # shows three horizontal rows (Non-Cancer, Solid, Hematologic) with AUROC on
-# the shared x-axis. Y-axis range standardized to 0.60-0.90 to match Panel A.
+# the shared x-axis. Limits are taken from the CI bounds so no interval is
+# clipped (the earlier fixed 0.65-0.85 range cut MEWS-SF and NEWS).
+sf6b_ylim = axis_limits_from(sf6b_data$ci_lower, sf6b_data$ci_upper, step = 0.05)
+
 sf6b = ggplot(sf6b_data, aes(x = cancer_type, y = auroc, color = cancer_type)) +
   geom_errorbar(
     aes(ymin = ci_lower, ymax = ci_upper),
@@ -730,7 +956,7 @@ sf6b = ggplot(sf6b_data, aes(x = cancer_type, y = auroc, color = cancer_type)) +
   geom_point(size = 2.5) +
   facet_wrap(~score_label, nrow = 1) +
   scale_color_manual(values = sf6b_pal, name = "Cancer type") +
-  scale_y_continuous(limits = c(0.65, 0.85), breaks = seq(0.65, 0.85, 0.05)) +
+  scale_y_continuous(limits = sf6b_ylim, breaks = seq(sf6b_ylim[1], sf6b_ylim[2], 0.05)) +
   coord_flip() +
   labs(x = NULL, y = "AUROC (95% CI)") +
   theme_ews() +
@@ -765,9 +991,19 @@ ggsave(here("output", "figures", "figure_s06_auroc_heterogeneity.pdf"),
 #   - 0-96 hour observation window
 #   - Full code only
 #   - No ED admission requirement
+#   - 2-, 6-, and 12-hour vitals carry-forward windows (R30)
 #   - 24-hour horizon, naive (treats repeated obs as independent)
 #   - 24-hour horizon, cluster bootstrap, all observations retained
 #   - 24-hour horizon, encounter-weighted bootstrap (one obs per encounter)
+#
+# The carry-forward rows (R30) have no site-level AUROC artifact; sites ship
+# only the maxscores count tables for cf2/cf6/cf12. Each site's AUROC is
+# therefore computed here from its own count table (calc_auroc_from_counts,
+# Hanley-McNeil SE) and the site estimates are pooled with the same
+# random-effects meta_analyze_aurocs() used for the main-analysis rows, so the
+# CI construction reflects between-site heterogeneity as the other sensitivity
+# rows do. The main analysis uses a 6-hour vitals window, so the cf6 row is a
+# recomputation of the main row by this route and should sit on top of it.
 #
 # The three 24-hour rows separate two distinct problems with the fixed-horizon
 # analysis. The cluster bootstrap corrects the non-independence of repeated
@@ -799,6 +1035,20 @@ if (exists("VARIANT_N")) {
   )
 }
 
+if (exists("VARIANT_N") && exists("ANALYSIS_LABS")) {
+  sf7_cf_labels = setNames(
+    sprintf("%s (n=%s)", ANALYSIS_LABS[CF_VARIANTS],
+            format(VARIANT_N[CF_VARIANTS], big.mark = ",")),
+    CF_VARIANTS
+  )
+} else {
+  sf7_cf_labels = c(
+    cf2  = "2-hour vitals carry-forward",
+    cf6  = "6-hour vitals carry-forward",
+    cf12 = "12-hour vitals carry-forward"
+  )
+}
+
 sf7_h24_naive_label   = "24h horizon (naive)"
 sf7_h24_boot_label    = "24h horizon (cluster bootstrap)"
 sf7_h24_bootenc_label = "24h horizon (one obs/encounter)"
@@ -820,6 +1070,87 @@ sf7_sens = auroc_results_final |>
   ) |>
   fselect(score_name, row_key, diff, diff_lower, diff_upper) |>
   as.data.table()
+
+## Part 1b: carry-forward windows (encounter-level, site-then-pool) ---------
+# maxscores_ca_raw carries the cf2/cf6/cf12 variants as analysis values with
+# the composite outcome. Compute one AUROC per (site, variant, score, cohort)
+# from the count table, meta-analyze across sites, then difference cohorts.
+
+sf7_cf = data.table()
+
+if (exists("CF_VARIANTS") && exists("meta_analyze_aurocs")) {
+
+  sf7_cf_prep = maxscores_ca_raw |>
+    fsubset(analysis %in% CF_VARIANTS) |>
+    fmutate(value = max_value) |>
+    fgroup_by(site, analysis, score_name, ca_01, value, outcome) |>
+    fsummarise(n = fsum(n)) |>
+    fungroup() |>
+    as.data.frame()
+
+  if (nrow(sf7_cf_prep) > 0) {
+
+    sf7_cf_combos = unique(sf7_cf_prep[, c("site", "analysis", "score_name", "ca_01")])
+
+    sf7_cf_list = vector("list", nrow(sf7_cf_combos))
+    for (i in seq_len(nrow(sf7_cf_combos))) {
+      st = sf7_cf_combos$site[i]
+      an = sf7_cf_combos$analysis[i]
+      sc = sf7_cf_combos$score_name[i]
+      ca = sf7_cf_combos$ca_01[i]
+      d  = sf7_cf_prep[sf7_cf_prep$site == st & sf7_cf_prep$analysis == an &
+                         sf7_cf_prep$score_name == sc & sf7_cf_prep$ca_01 == ca, ,
+                       drop = FALSE]
+      auc_res = as.data.frame(calc_auroc_from_counts(d))
+      sf7_cf_list[[i]] = data.table(
+        site       = st,
+        analysis   = an,
+        score_name = sc,
+        ca_01      = ca,
+        auroc      = auc_res$auroc,
+        auroc_se   = auc_res$se
+      )
+    }
+    sf7_cf_site = rbindlist(sf7_cf_list)
+
+    # QC: every site must contribute all three variants for all five scores
+    sf7_cf_expected = length(unique(sf7_cf_site$site)) * length(CF_VARIANTS) *
+      length(score_levels) * 2L
+    if (nrow(sf7_cf_site) != sf7_cf_expected) {
+      message("  WARNING: carry-forward site AUROC rows = ", nrow(sf7_cf_site),
+              ", expected ", sf7_cf_expected, " (site x variant x score x cohort)")
+    }
+
+    sf7_cf_pooled = sf7_cf_site[, {
+      ma = meta_analyze_aurocs(.SD)
+      list(auroc = ma$auroc, auroc_se = ma$auroc_se, k_sites = ma$k_sites)
+    }, by = .(analysis, score_name, ca_01)]
+
+    sf7_cf = sf7_cf_pooled |>
+      as_tidytable() |>
+      fselect(score_name, ca_01, analysis, auroc, auroc_se) |>
+      pivot_wider(names_from = ca_01, values_from = c(auroc, auroc_se), names_sep = "_") |>
+      fmutate(
+        diff       = auroc_1 - auroc_0,
+        diff_se    = sqrt(auroc_se_1^2 + auroc_se_0^2),
+        diff_lower = diff - 1.96 * diff_se,
+        diff_upper = diff + 1.96 * diff_se,
+        row_key    = analysis
+      ) |>
+      fselect(score_name, row_key, diff, diff_lower, diff_upper) |>
+      as.data.table()
+
+    message("  Carry-forward rows computed for ",
+            length(unique(sf7_cf$row_key)), " variant(s) x ",
+            length(unique(sf7_cf$score_name)), " scores")
+
+  } else {
+    message("  No carry-forward variants in maxscores_ca_raw; skipping cf rows.")
+  }
+
+} else {
+  message("  CF_VARIANTS or meta_analyze_aurocs not found; skipping cf rows.")
+}
 
 ## Part 2: 24-hour horizon, naive (pooled counts, no clustering adjustment) --
 # Compute per-cohort AUROC from counts_h24_raw using calc_auroc_from_counts,
@@ -997,7 +1328,7 @@ if (exists("bootenc_h24_raw") && nrow(bootenc_h24_raw) > 0) {
 
 ## Combine all rows and build the figure ------------------------------------
 
-sf7_all = rbindlist(list(sf7_sens, sf7_h24n, sf7_h24b, sf7_h24be),
+sf7_all = rbindlist(list(sf7_sens, sf7_cf, sf7_h24n, sf7_h24b, sf7_h24be),
                     use.names = TRUE, fill = TRUE)
 
 # Belt-and-suspenders: normalize score_name before format_score() so any
@@ -1011,12 +1342,14 @@ sf7_all[, score_name := tolower(str_remove(score_name, "_total$"))]
 # the bottom and bootstrap at the top.
 sf7_row_order = c(
   names(sf7_variant_labels),
+  CF_VARIANTS,
   "h24_naive",
   "h24_bootstrap",
   "h24_bootenc"
 )
 sf7_row_labels = c(
   sf7_variant_labels,
+  sf7_cf_labels,
   h24_naive     = sf7_h24_naive_label,
   h24_bootstrap = sf7_h24_boot_label,
   h24_bootenc   = sf7_h24_bootenc_label
@@ -1027,6 +1360,7 @@ sf7_all[, `:=`(
   row_label   = factor(row_key, levels = sf7_row_order, labels = sf7_row_labels[sf7_row_order]),
   row_group   = fcase(
     row_key %in% names(sf7_variant_labels), "Sensitivity analyses",
+    row_key %in% CF_VARIANTS,               "Carry-forward window",
     row_key == "h24_naive",                 "24-hour horizon",
     row_key == "h24_bootstrap",             "24-hour horizon",
     row_key == "h24_bootenc",               "24-hour horizon",
@@ -1045,6 +1379,10 @@ if (nrow(sf7_bad) > 0) {
   sf7_all = sf7_all[!is.na(score_label)]
 }
 
+# y limits cover every CI; the fixed -0.10/+0.06 used earlier clipped the
+# full-code and one-encounter rows for MEWS-SF and NEWS.
+sf7_ylim = axis_limits_from(sf7_all$diff_lower, sf7_all$diff_upper, step = 0.02)
+
 sf7 = ggplot(sf7_all,
              aes(x = row_label, y = diff,
                  ymin = diff_lower, ymax = diff_upper)) +
@@ -1059,14 +1397,20 @@ sf7 = ggplot(sf7_all,
   geom_point(size = 2.5, color = "gray25") +
   facet_wrap(~score_label, nrow = 1) +
   scale_y_continuous(
-    limits = c(-0.10, 0.06),
-    breaks = seq(-0.10, 0.06, 0.04),
+    limits = sf7_ylim,
+    breaks = seq(sf7_ylim[1], sf7_ylim[2], 0.04),
     labels = function(x) sprintf("%.2f", x)
   ) +
   coord_flip() +
   labs(
     x = NULL, y = "AUROC Difference (Cancer − Non-Cancer)",
-    caption = "Positive values indicate higher discrimination in cancer patients.\nThe 24-hour naive row omits a CI because treating repeated observations as independent produces misleadingly tight uncertainty.\nThe cluster bootstrap row reports the honest CI for the same observation-weighted estimate; the one-observation-per-encounter row reweights encounters equally, removing length of stay from the estimate."
+    caption = paste(
+      "Positive values indicate higher discrimination in cancer patients.",
+      "Carry-forward rows rescore every encounter with the stated vitals window (main analysis: 6 hours); site AUROCs are computed from count tables and pooled by random-effects meta-analysis.",
+      "The 24-hour naive row omits a CI because treating repeated observations as independent produces misleadingly tight uncertainty.",
+      "The cluster bootstrap row reports the honest CI for the same observation-weighted estimate; the one-observation-per-encounter row reweights encounters equally, removing length of stay from the estimate.",
+      sep = "\n"
+    )
   ) +
   theme_ews() +
   theme(
@@ -1076,7 +1420,7 @@ sf7 = ggplot(sf7_all,
   )
 
 ggsave(here("output", "figures", "figure_s07_auroc_gap_robustness.pdf"),
-       sf7, width = 14, height = 6)
+       sf7, width = 14, height = 7)
 
 # ==============================================================================
 # SUPP FIGURE 3: Score co-positivity (mirrored UpSet-style)
@@ -1095,7 +1439,7 @@ upset_agg = upset_final |>
     combo_label = pmap_chr(
       list(sirs, qsofa, mews, mews_sf, news),
       function(s, q, m, ms, nw) {
-        scores = c("SIRS", "QSOFA", "MEWS", "MEWS-SF", "NEWS")[c(s, q, m, ms, nw) == 1]
+        scores = c("SIRS", "qSOFA", "MEWS", "MEWS-SF", "NEWS")[c(s, q, m, ms, nw) == 1]
         if (length(scores) == 0) return("None")
         paste(scores, collapse = " + ")
       }
@@ -1134,15 +1478,41 @@ upset_plot_data = upset_plot_data |>
 
 sf3_pal = build_cohort_palette(levels(upset_plot_data$cohort_label))
 
+## bar labels: n and within-cohort percentage (R21) ------------------------------
+# Percentages are of all encounters in the cohort (total_cohort above), not of
+# the encounters shown in the top-15 patterns, so a reader can add them to the
+# "any positive" figures in the text. Labels sit just beyond each bar end on
+# its own side of the axis; the axis is widened so the longest label fits.
+
+upset_plot_data = upset_plot_data |>
+  fmutate(
+    bar_label = sprintf("%s (%.1f%%)", format(n, big.mark = ",", trim = TRUE), pct),
+    label_hjust = fifelse(ca_01 == 1, 1, 0),
+    label_y     = fifelse(ca_01 == 1, n_mirror - 0.01 * max(abs(n_mirror)),
+                                      n_mirror + 0.01 * max(abs(n_mirror)))
+  )
+
+sf3_y_max = max(abs(upset_plot_data$n_mirror))
+sf3_y_lim = c(-1.45, 1.45) * sf3_y_max
+
 ## bar plot -------------------------------------------------------------------
 
 p_bars = ggplot(upset_plot_data, aes(x = combo_label, y = n_mirror, fill = cohort_label)) +
   geom_bar(stat = "identity", width = 0.7) +
   geom_hline(yintercept = 0, linewidth = 0.3) +
+  geom_text(
+    aes(y = label_y, label = bar_label, hjust = label_hjust),
+    size = 2.6, color = "gray25"
+  ) +
   scale_fill_manual(values = sf3_pal, name = "Cohort") +
-  scale_y_continuous(labels = function(x) scales::comma(abs(x)), breaks = scales::pretty_breaks(n = 6)) +
+  scale_y_continuous(
+    labels = function(x) scales::comma(abs(x)),
+    breaks = scales::pretty_breaks(n = 6),
+    limits = sf3_y_lim
+  ) +
   coord_flip() +
-  labs(x = NULL, y = "Number of Encounters", title = "Score Co-Positivity Patterns") +
+  labs(x = NULL, y = "Number of Encounters (label: n, % of cohort)",
+       title = "Score Co-Positivity Patterns") +
   theme_minimal(base_size = 11) +
   theme(
     legend.position    = "top",
@@ -1162,7 +1532,7 @@ matrix_data = upset_plot_data |>
   fmutate(
     score_label = factor(score,
                          levels = c("sirs", "qsofa", "mews", "mews_sf", "news"),
-                         labels = c("SIRS", "QSOFA", "MEWS", "MEWS-SF", "NEWS"))
+                         labels = c("SIRS", "qSOFA", "MEWS", "MEWS-SF", "NEWS"))
   )
 
 p_matrix = ggplot(matrix_data, aes(x = score_label, y = combo_label)) +
@@ -1211,7 +1581,13 @@ ggsave(here("output", "figures", "figure_s03_copositivity.pdf"),
 # respiratory → neurologic → other) so the same component sits at the same
 # vertical position in every panel. Rows left blank where a score does not
 # include the component. SpO2 (NEWS) and SpO2/FiO2 (MEWS-SF) are collapsed
-# into a single "Oxygenation" row since no score uses both.
+# into a single "Oxygenation" row since no score uses both. The NEWS
+# supplemental-oxygen item (component "o2", added in round two) has its own
+# row; before it was mapped it rendered as an "NA" row.
+#
+# Marker sizes (R22): the non-cancer marker is drawn first and larger, the
+# cancer marker second and smaller, so both remain visible where the
+# percentages coincide.
 
 message("\n== Building Supp Figure 4 (component contributions) ==")
 
@@ -1255,6 +1631,7 @@ component_labels = c(
   sbp         = "Systolic BP",
   rr          = "Respiratory rate",
   oxygenation = "Oxygenation",
+  o2          = "Supplemental oxygen",
   gcs         = "Mental status",
   temp        = "Temperature",
   wbc         = "WBC"
@@ -1298,6 +1675,10 @@ sfC_labels = sfC_wide |>
 
 sfC_pal = build_cohort_palette(levels(sfC_plot$cohort_lab))
 
+# non-cancer rows first so the larger marker is drawn beneath the cancer marker
+sfC_plot = as.data.table(sfC_plot)
+setorder(sfC_plot, ca_01)
+
 ## single-row plot with shared y-axis -----------------------------------------
 # By using facet_wrap with a single row and NOT dropping unused factor levels,
 # every panel shows the same set of components in the same order. Panels for
@@ -1320,7 +1701,7 @@ sfC = ggplot(sfC_plot, aes(x = pct, y = component_lab)) +
     inherit.aes = FALSE,
     color = "gray60", linewidth = 0.6
   ) +
-  geom_point(aes(color = cohort_lab), size = 2.8) +
+  geom_point(aes(color = cohort_lab, size = cohort_lab)) +
   geom_text(
     data = sfC_labels,
     aes(x = 105, y = component_lab, label = diff_txt),
@@ -1329,6 +1710,8 @@ sfC = ggplot(sfC_plot, aes(x = pct, y = component_lab)) +
   ) +
   facet_wrap(~score_lab, nrow = 1, drop = FALSE) +
   scale_color_manual(values = sfC_pal, name = "Cohort") +
+  scale_size_manual(values = setNames(c(3.6, 2.4), levels(sfC_plot$cohort_lab)),
+                    name = "Cohort") +
   scale_x_continuous(
     limits = c(0, 115), breaks = seq(0, 100, 25),
     labels = function(x) ifelse(x <= 100, paste0(x, "%"), "")

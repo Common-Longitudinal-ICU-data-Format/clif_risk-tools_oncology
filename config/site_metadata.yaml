@@ -1,0 +1,81 @@
+# Coordinating-center site metadata for eTable 1 (read by 08_supplement.R).
+# One key per site token (lowercase, matching the artifact filenames).
+#
+# Hospital declaration, one of:
+#   hospital_ids   list of literal ADT hospital_id values, lowercased and
+#                  trimmed, exactly as the site pipeline sees them (mirrors the
+#                  site's config hospital_ids). Defines the reported count and
+#                  lets the pooled run name any excluded or missing id.
+#   n_hospitals    a bare count, for a site whose ids the coordinating center
+#                  does not yet hold. The pooled run reports this number and
+#                  warns if the observed count differs. Replace with the list
+#                  when the site confirms it.
+# Do not give both unless they agree; the pooled run stops if they conflict.
+#
+# hospitalizations is NOT set here; it comes from each site's flow file.
+# Bed counts, study period, and IRB are from the April 2026 submission
+# (eTable 1) and carry forward unless a site reports a change.
+
+emory:
+  health_system: "Emory University"
+  n_hospitals: 9
+  date_range: "2016-2024"
+  adult_inpatient_beds: 1959
+  adult_icu_beds: 308
+  irb: "Study P010108"
+
+hopkins:
+  health_system: "Johns Hopkins Health System"
+  hospital_ids: ["jhh", "bmc", "hcg", "smh", "sub"]
+  date_range: "2017-2024"
+  adult_inpatient_beds: 2187
+  adult_icu_beds: 251
+  irb: "IRB00453058"
+
+michigan:
+  health_system: "University of Michigan"
+  n_hospitals: 1
+  date_range: "2023-2024"
+  adult_inpatient_beds: 1107
+  adult_icu_beds: 84
+  irb: "HUM00260807"
+
+ohsu:
+  health_system: "Oregon Health & Science University"
+  hospital_ids: ["ohsu", "hmc"]
+  date_range: "2016-2024"
+  adult_inpatient_beds: 791
+  adult_icu_beds: 90
+  irb: "00025188"
+
+rush:
+  health_system: "Rush University"
+  n_hospitals: 1
+  date_range: "2016-2024"
+  adult_inpatient_beds: 727
+  adult_icu_beds: 132
+  irb: "24082804-IRB"
+
+ucmc:
+  health_system: "University of Chicago"
+  n_hospitals: 1
+  date_range: "2016-2024"
+  adult_inpatient_beds: 805
+  adult_icu_beds: 146
+  irb: "IRB20-1823"
+
+umn:
+  health_system: "University of Minnesota"
+  n_hospitals: 11
+  date_range: "2016-2024"
+  adult_inpatient_beds: 2845
+  adult_icu_beds: 209
+  irb: "STUDY00014815"
+
+upenn:
+  health_system: "University of Pennsylvania"
+  n_hospitals: 8
+  date_range: "2016-2024"
+  adult_inpatient_beds: 2608
+  adult_icu_beds: 305
+  irb: "853717"

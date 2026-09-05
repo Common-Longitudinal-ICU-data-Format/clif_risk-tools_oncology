@@ -12,6 +12,7 @@ RUN_DISCRIMINATION = TRUE
 RUN_THRESHOLD      = TRUE
 RUN_META           = TRUE
 RUN_SUBGROUPS      = TRUE
+RUN_SUPPLEMENT     = TRUE
 RUN_FIGURES        = TRUE
 
 # Set working directory to project root (uncomment if needed)
@@ -34,13 +35,18 @@ message("")
 
 message("== Checking dependencies ==\n")
 
+# One entry per package a pooled script attaches or calls with ::. glmmTMB and
+# UpSetR were removed in round two (no longitudinal model; the UpSet panel is
+# drawn with ggplot2). yaml reads site_metadata.yaml in 08_supplement.R; purrr
+# and DiagrammeR are attached by 06_figures.R; htmltools by qc.R. All are already
+# in the repository uvr lock because the site pipeline requires yaml and the
+# remainder were installed for round one.
+
 required_packages = c(
-  "data.table", "tidytable", "collapse", "stringr", "here",
-  "pROC", "metafor", "glmmTMB",
-  "ggplot2", "patchwork", "scales",
-  "flextable", "officer",
-  "DiagrammeR", "DiagrammeRsvg", "rsvg",
-  "UpSetR"
+  "data.table", "tidytable", "collapse", "stringr", "here", "yaml",
+  "pROC", "metafor", "WeightedROC",
+  "ggplot2", "patchwork", "scales", "purrr", "DiagrammeR", "htmltools",
+  "flextable", "officer"
 )
 
 missing = required_packages[!sapply(required_packages, requireNamespace, quietly = TRUE)]
@@ -79,7 +85,7 @@ message("  Output directories ready\n")
 
 message("== Loading data ==\n")
 
-source(here::here("_code", "00_load.R"))
+source(here::here("for_pooled_analysis", "00_load.R"))
 
 message("")
 
@@ -98,7 +104,7 @@ if (RUN_TABLES) {
   t1 = Sys.time()
   
   tryCatch({
-    source(here::here("_code", "01_tables.R"))
+    source(here::here("for_pooled_analysis", "01_tables.R"))
     run_log$tables = list(status = "success", time = Sys.time() - t1)
     message("\n  ✓ 01_tables.R complete (", round(difftime(Sys.time(), t1, units = "secs"), 1), " sec)\n")
   }, error = function(e) {
@@ -121,7 +127,7 @@ if (RUN_DISCRIMINATION) {
   t1 = Sys.time()
   
   tryCatch({
-    source(here::here("_code", "02_discrimination.R"))
+    source(here::here("for_pooled_analysis", "02_discrimination.R"))
     run_log$discrimination = list(status = "success", time = Sys.time() - t1)
     message("\n  ✓ 02_discrimination.R complete (", round(difftime(Sys.time(), t1, units = "secs"), 1), " sec)\n")
   }, error = function(e) {
@@ -144,7 +150,7 @@ if (RUN_THRESHOLD) {
   t1 = Sys.time()
   
   tryCatch({
-    source(here::here("_code", "03_threshold.R"))
+    source(here::here("for_pooled_analysis", "03_threshold.R"))
     run_log$threshold = list(status = "success", time = Sys.time() - t1)
     message("\n  ✓ 03_threshold.R complete (", round(difftime(Sys.time(), t1, units = "secs"), 1), " sec)\n")
   }, error = function(e) {
@@ -167,7 +173,7 @@ if (RUN_META) {
   t1 = Sys.time()
   
   tryCatch({
-    source(here::here("_code", "04_meta.R"))
+    source(here::here("for_pooled_analysis", "04_meta.R"))
     run_log$meta = list(status = "success", time = Sys.time() - t1)
     message("\n  ✓ 04_meta.R complete (", round(difftime(Sys.time(), t1, units = "secs"), 1), " sec)\n")
   }, error = function(e) {
@@ -190,7 +196,7 @@ if (RUN_SUBGROUPS) {
   t1 = Sys.time()
   
   tryCatch({
-    source(here::here("_code", "05_subgroups.R"))
+    source(here::here("for_pooled_analysis", "05_subgroups.R"))
     run_log$subgroups = list(status = "success", time = Sys.time() - t1)
     message("\n  ✓ 05_subgroups.R complete (", round(difftime(Sys.time(), t1, units = "secs"), 1), " sec)\n")
   }, error = function(e) {
@@ -200,6 +206,34 @@ if (RUN_SUBGROUPS) {
   
 } else {
   message("\n  ○ 05_subgroups.R skipped\n")
+}
+
+## 08: supplement --------------------------------------------------------------
+# Consumes the artifact families that no other script reads: first-ward score
+# distributions (R06), hospital types (R08/R18), admission diagnoses (R09),
+# number needed to evaluate and lead time (R25), monitoring and missingness
+# (R30), and the between-site descriptive ranges (R31). Runs before 06 so its
+# tables exist alongside the figures.
+
+if (RUN_SUPPLEMENT) {
+
+  message("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+  message("  08_supplement.R")
+  message("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+  t1 = Sys.time()
+
+  tryCatch({
+    source(here::here("for_pooled_analysis", "08_supplement.R"))
+    run_log$supplement = list(status = "success", time = Sys.time() - t1)
+    message("\n  ✓ 08_supplement.R complete (", round(difftime(Sys.time(), t1, units = "secs"), 1), " sec)\n")
+  }, error = function(e) {
+    run_log$supplement <<- list(status = "failed", error = conditionMessage(e))
+    message("\n  ✗ 08_supplement.R FAILED: ", conditionMessage(e), "\n")
+  })
+
+} else {
+  message("\n  ○ 08_supplement.R skipped\n")
 }
 
 ## 06: figures -----------------------------------------------------------------
@@ -213,7 +247,7 @@ if (RUN_FIGURES) {
   t1 = Sys.time()
   
   tryCatch({
-    source(here::here("_code", "06_figures.R"))
+    source(here::here("for_pooled_analysis", "06_figures.R"))
     run_log$figures = list(status = "success", time = Sys.time() - t1)
     message("\n  ✓ 06_figures.R complete (", round(difftime(Sys.time(), t1, units = "secs"), 1), " sec)\n")
   }, error = function(e) {
@@ -239,8 +273,8 @@ message("")
 # status table
 status_df = data.frame(
   Script = c("01_tables", "02_discrimination", "03_threshold", 
-             "04_meta", "05_subgroups", "06_figures"),
-  Status = sapply(c("tables", "discrimination", "threshold", "meta", "subgroups", "figures"), function(x) {
+             "04_meta", "05_subgroups", "08_supplement", "06_figures"),
+  Status = sapply(c("tables", "discrimination", "threshold", "meta", "subgroups", "supplement", "figures"), function(x) {
     if (is.null(run_log[[x]])) return("skipped")
     run_log[[x]]$status
   })

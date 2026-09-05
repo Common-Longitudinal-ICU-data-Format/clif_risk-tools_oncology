@@ -24,9 +24,8 @@
 # uvr::run("code/run_all.R").
 #
 # Every namespace the pipeline touches is verified here, before stage 01, so a
-# site missing one package fails in the first seconds rather than an hour into
-# the run. pkgs_attached is attached with library(). pkgs_required is verified
-# present and reached with :: at its call sites.
+# site missing one package fails early. pkgs_attached is attached with library(). 
+# pkgs_required is verified present and reached with :: at its call sites.
 
 pkgs_attached =
   c(
@@ -58,9 +57,8 @@ pkgs_checked = c(pkgs_attached, pkgs_required)
 
 # Are we running inside the uvr project library? Sourcing this file from a plain
 # R session would attach whatever the system library happens to hold, which is
-# the exact cross-site version drift uvr exists to prevent, so stop before
-# attaching anything. Backslashes are normalized first so the test behaves
-# identically on Windows.
+# the kind of version drift uvr prevents, so stop before attaching anything.
+# Backslashes are normalized first so the test behaves identically on Windows.
 
 lib_paths_norm = gsub("\\\\", "/", .libPaths())
 in_uvr_lib     = any(grepl(".uvr/library", lib_paths_norm, fixed = TRUE))
@@ -331,6 +329,63 @@ if (!allow_sparse_o2_ok) {
 rm(allow_sparse_o2_ok)
 
 message(sprintf("Sparse-oxygen override | allow_sparse_o2 = %s", allow_sparse_o2))
+
+### hospital_ids must be a non-empty list of distinct lowercase strings ---------
+# This key declares the hospital_id values (from the ADT table) that the site
+# expects to see among cohort encounters. 01_cohort.R lowercases the ADT
+# hospital_id, compares the observed set against this list, and STOPS the run
+# on any difference in either direction: an id in the data that is not declared
+# (a placeholder such as "xxx", a campus-level split, a mapping error) or a
+# declared id with no cohort encounters (a hospital silently merged into
+# another). The site fixes hospital_id or this list, then reruns. The same list
+# feeds the hospital-type tally for eTable 1, so the reported hospital count
+# equals the declared count by construction. The key is required; a config
+# predating it must be updated from config_clif_oncrisk_template.yaml.
+#
+# YAML form (one id per line, lowercase; case and surrounding whitespace are
+# normalized here, so "JHH" and "jhh" are the same hospital):
+#
+#   hospital_ids:
+#     - "jhh"
+#     - "bmc"
+
+hospital_ids_allowed = config$hospital_ids
+
+if (is.null(hospital_ids_allowed) || length(hospital_ids_allowed) == 0L) {
+  stop(
+    paste0(
+      "Missing 'hospital_ids' in config_clif_oncrisk.yaml. List every ADT ",
+      "hospital_id that contributes encounters to this study, one per line, ",
+      "as shown in config/config_clif_oncrisk_template.yaml."
+    ),
+    call. = FALSE
+  )
+}
+
+hospital_ids_allowed = tolower(trimws(as.character(unlist(hospital_ids_allowed))))
+
+hospital_ids_ok =
+  length(hospital_ids_allowed) > 0L &&
+  !anyNA(hospital_ids_allowed) &&
+  all(nzchar(hospital_ids_allowed)) &&
+  !anyDuplicated(hospital_ids_allowed)
+
+if (!hospital_ids_ok) {
+  stop(
+    paste0(
+      "Invalid 'hospital_ids' in config_clif_oncrisk.yaml: entries must be ",
+      "non-empty strings with no duplicates after lowercasing. Found: ",
+      paste(sprintf("'%s'", hospital_ids_allowed), collapse = ", ")
+    ),
+    call. = FALSE
+  )
+}
+
+rm(hospital_ids_ok)
+
+message(sprintf("Declared hospitals | %d hospital_id(s): %s",
+                length(hospital_ids_allowed),
+                paste(hospital_ids_allowed, collapse = ", ")))
 
 ### pull time zone from site details -------------------------------------------
 
