@@ -20,6 +20,7 @@
   - [03a_artifacts.R — Discrimination, Thresholds, Sensitivity](#03a_artifactsr--discrimination-thresholds-sensitivity)
   - [03b_leadtime.R — Lead Time to Deterioration](#03b_leadtimer--lead-time-to-deterioration)
   - [run_all.R — Orchestration and Manifest](#run_allr--orchestration-and-manifest)
+- [Coordinating Center](#coordinating-center)
 - [Output Artifacts](#output-artifacts)
 - [Privacy and Small-Cell Handling](#privacy-and-small-cell-handling)
 - [Troubleshooting](#troubleshooting)
@@ -61,7 +62,7 @@ Round two also replaces on-the-fly package installation with [uvr](https://githu
 
 - **Federated architecture** — Patient-level data never leaves the site; only aggregate count tables are shared
 - **Pinned, portable environment** — uvr installs the R version and the exact locked package set into a project-local library on macOS, Linux, and Windows
-- **Automated validation** — Schema checks, value-domain verification, and case-insensitive column resolution
+- **Automated validation** — Schema checks, value-domain verification, case-insensitive column resolution, and a declared-hospital check that stops the run when `hospital_id` does not match the site's configuration
 - **Flexible input formats** — Supports Parquet, CSV, and FST file formats
 - **Score derivation with explicit imputation rules** — LOCF imputation, FiO₂ inference, ward-restricted calculation, the NEWS supplemental-oxygen item
 - **Five competing-risk outcomes** — Composite and its decompositions, each with per-outcome event and censoring times
@@ -85,7 +86,7 @@ Round two also replaces on-the-fly package installation with [uvr](https://githu
 │   ├── clif_sites.csv                  # Valid site identifiers and time zones
 │   └── icd10cm_casefinding_2023.xlsx   # Cancer case-finding code list
 │
-├── code/
+├── code/                               # SITE pipeline — every site runs this
 │   ├── 00_setup.R                      # Environment verification, config loading, CLIF validation
 │   ├── 01_cohort.R                     # Cohort construction, outcomes, comorbidities, cancer codes
 │   ├── 02_scores.R                     # Time-varying scores, then Table 2 and admission dx
@@ -94,6 +95,12 @@ Round two also replaces on-the-fly package installation with [uvr](https://githu
 │   ├── 03a_artifacts.R                 # Discrimination, thresholds, horizons, sensitivity variants
 │   ├── 03b_leadtime.R                  # Lead time from first alert to deterioration
 │   └── run_all.R                       # Orchestration, run report, and upload manifest
+│
+├── for_pooled_analysis/                # COORDINATING CENTER only — sites do not run this
+│   ├── 00_load.R ... 08_supplement.R   # Pools uploaded artifacts into tables and figures
+│   ├── qc.R                            # Cross-site QC on the uploaded artifacts
+│   └── run_pooled.R                    # Orchestration
+├── site_metadata.yaml                  # Coordinating-center metadata for eTable 1 (see below)
 │
 ├── .here                               # Project-root sentinel for the here package (see Installation)
 │
@@ -132,7 +139,7 @@ The pipeline requires the following tables in your `clif_data_location` director
 |-------|---------|
 | `clif_patient` | Demographics, death dates |
 | `clif_hospitalization` | Admission/discharge times, ages, dispositions |
-| `clif_adt` | ADT events for ward/ICU/ED identification |
+| `clif_adt` | ADT events for ward/ICU/ED identification; `hospital_id` and `hospital_type` |
 | `clif_hospital_diagnosis` | ICD-10-CM codes for cancer identification and admission diagnoses |
 | `clif_vitals` | Heart rate, respiratory rate, temperature, systolic BP, SpO₂ |
 | `clif_labs` | WBC and pCO₂ (SIRS); broader lab set validated at load |
@@ -275,6 +282,12 @@ time_zone: "America/Los_Angeles"
 
 # Sparse-oxygen override — leave false unless instructed otherwise
 allow_sparse_o2: false
+
+# Every ADT hospital_id that contributes encounters to this study, one per
+# line, lowercase. Required. See "Declaring your hospitals" below.
+hospital_ids:
+  - "hospital_a"
+  - "hospital_b"
 ```
 
 ### Configuration Parameters
@@ -287,10 +300,23 @@ allow_sparse_o2: false
 | `site_lowercase` | Your site's identifier; trimmed and lowercased, then validated against `clif_sites.csv` | `"emory"`, `"ohsu"` |
 | `time_zone` | Your site's local time zone | `"America/Chicago"` |
 | `allow_sparse_o2` | Downgrades the NEWS sparse-oxygen stop to a warning | `false` |
+| `hospital_ids` | **Required.** The literal `hospital_id` values from your ADT table for every hospital in the study cohort; trimmed and lowercased | `["jhh", "bmc", "hcg"]` |
 
 > **Note on `project_location`:** This field is retained in the config but is no longer used to resolve paths. All directory creation and every write resolve through `here()` off the repository root, so `proj_tables/` and the upload directory are created there regardless of `project_location`.
 
 > **Note on `allow_sparse_o2`:** `02_scores.R` stops the run when more than 90% of NEWS score rows have no supplemental-oxygen measurement within 6 hours, which means `lpm_set` and `fio2_set` exist as columns in `clif_respiratory_support` but are effectively empty. Setting `allow_sparse_o2: true` downgrades that stop to a warning, and the run finishes with NEWS scored without its supplemental-oxygen item. **Set it to `true` only after the coordinating center has confirmed that your oxygen data are genuinely absent.** The key is optional — an older config that omits it reads as `false` — but the value must be unquoted `true` or `false`; a quoted `"false"` is rejected rather than coerced.
+
+### Declaring your hospitals
+
+`hospital_ids` lists the `hospital_id` values, exactly as they appear in your `clif_adt` table, for every hospital whose encounters belong in this study. The pipeline lowercases and trims both the list and the data before comparing, so `"JHH"` and `"jhh"` are the same hospital; nothing else is normalized. Do not strip a system prefix, collapse punctuation, or otherwise edit the values — write them as they are. Quote every entry so numeric-looking ids stay strings.
+
+`01_cohort.R` compares the `hospital_id` values among cohort encounters against this list after all exclusions have been applied and **stops the run** on any difference in either direction:
+
+- an id in the data that is not on the list (a placeholder such as `xxx`, a campus-level split, a mapping error in the extract);
+- an id on the list with no cohort encounters (a hospital silently merged into another, or a typo);
+- encounters with a missing `hospital_id`, reported as `<missing>`.
+
+The console lists the offending ids with encounter counts. Fix `hospital_id` in the extract or correct the list, then rerun `01_cohort.R`. Hospitals that appear in your ADT table only for encounters this study excludes (a pediatric hospital, an elective-only facility) do not need to be listed and do not trip the check. The same list drives the hospital count reported in eTable 1, so the count the manuscript states for your health system is the count you declared.
 
 ### A note on git hygiene
 
@@ -312,18 +338,15 @@ Ensure your site identifier appears in `config/clif_sites.csv`. Setup stops with
 
 ### Upgrading from an earlier round-two checkout
 
-If this machine ever ran an earlier round-two version of the pipeline, delete the
-output directory before the first run of this version:
+If this machine ever ran an earlier round-two version of the pipeline:
 
-```bash
-rm -rf upload_to_box_v2
-```
+1. Delete the output directory before the first run of this version. Earlier versions wrote artifact families this version no longer produces (a `meta/` directory, `dxgroup` strata). The pipeline only deletes files it regenerates, and the manifest lists **everything** in `upload_to_box_v2/`, so stale files from an old run would otherwise ship to the coordinating center. A clean directory costs nothing: `00_setup.R` recreates the structure.
 
-Earlier versions wrote artifact families this version no longer produces (a
-`meta/` directory, `dxgroup` strata). The pipeline only deletes files it
-regenerates, and the manifest lists **everything** in `upload_to_box_v2/`, so
-stale files from an old run would otherwise ship to the coordinating center.
-A clean directory costs nothing: `00_setup.R` recreates the structure.
+   ```bash
+   rm -rf upload_to_box_v2
+   ```
+
+2. Add the `hospital_ids` key to `config/config_clif_oncrisk.yaml`, copying the form from the template. A config that predates the key stops in `00_setup.R` with instructions.
 
 ### Standard Execution
 
@@ -363,7 +386,9 @@ source("code/03b_leadtime.R")
 
 ### Expected Runtime
 
-Runtime scales with encounter and vitals/lab volume. For orientation, a site of roughly 145,000 encounters completes the full pipeline in about 30 minutes (the bootstrap and the fixed-horizon families dominate); larger sites take proportionally longer. The first `uvr sync --frozen` adds a few minutes once, and subsequent syncs are near-instant.
+Runtime scales with encounter and score-row volume. A site of roughly 145,000 hospitalizations (75,000 ED-admitted ward encounters, 6.8 million score rows) completes the full pipeline in **about 30 minutes**; a site with 3.5× the score rows should expect two to three hours. The bootstrap in `03a` is the longest single step at large sites. The first `uvr sync --frozen` adds a few minutes once, and subsequent syncs are near-instant.
+
+`03a` prints one progress line per outcome or variant as the artifact matrix advances, with elapsed seconds, and the two bootstraps report every 50 replicates. If the console is silent for more than a few minutes during `03a`, the run has stalled rather than slowed.
 
 | Stage | Notes |
 |-------|-------|
@@ -386,12 +411,12 @@ Runtime scales with encounter and vitals/lab volume. For orientation, a site of 
 
 1. **Environment verification** — Confirms the session is using the uvr project library, confirms the running R matches `.r-version`, then confirms every namespace the pipeline touches is installed. Installs nothing. A missing package stops the run in the first seconds with the command that repairs it, rather than deep into a stage that reaches for it. A checkout predating the pin has no `.r-version`, which reads as no constraint rather than as a failure.
 2. **Resource detection** — Identifies cores and available RAM; sets conservative thread limits for Arrow, data.table, and collapse
-3. **Configuration loading** — Reads `config_clif_oncrisk.yaml`, trims and lowercases `site_lowercase` and `file_type`, validates the site against `clif_sites.csv`, and validates `allow_sparse_o2` as an unquoted logical
+3. **Configuration loading** — Reads `config_clif_oncrisk.yaml`, trims and lowercases `site_lowercase` and `file_type`, validates the site against `clif_sites.csv`, validates `allow_sparse_o2` as an unquoted logical, and validates `hospital_ids` as a non-empty list of distinct, non-blank strings (lowercased and trimmed)
 4. **Artifact destination** — Sets the single `BOX_DIR` constant (`upload_to_box_v2`) that governs every write in the pipeline, and creates the six analysis subdirectories
 5. **CLIF table loading** — Opens all required tables (Parquet/CSV/FST)
 6. **Schema and value-domain validation** — Verifies required columns exist (case-insensitive) and expected categorical values are present
 
-**Outputs:** Loaded CLIF tables in memory; `BOX_DIR`, `allow_sparse_o2`, and site constants; `<BOX_DIR>/env_manifest_<site>.csv`; validation report to console.
+**Outputs:** Loaded CLIF tables in memory; `BOX_DIR`, `allow_sparse_o2`, `hospital_ids_allowed`, and site constants; `<BOX_DIR>/env_manifest_<site>.csv`; validation report to console.
 
 > **The environment manifest.** `00_setup.R` writes `env_manifest_<site>.csv`, a long-format table with one row per environment fact (R version, the pinned version from `.r-version`, platform, operating system, locale, time zone, library path) followed by one row per verified package and its installed version. It is written in `00` rather than assembled at the end of the run because each stage deletes every global not on its keep-list, so the objects would not survive to `run_all.R`. When one site's results diverge from the other seven, this file answers the first question asked, which is whether that site ran a different environment.
 
@@ -399,7 +424,7 @@ Runtime scales with encounter and vitals/lab volume. For orientation, a site of 
 
 ### 01_cohort.R — Cohort Construction
 
-**Purpose:** Build the analytic cohort, derive outcomes and comorbidities, and export cancer-code frequencies.
+**Purpose:** Build the analytic cohort, derive outcomes and comorbidities, verify the hospital set, and export cancer-code frequencies.
 
 #### Inclusion Criteria
 
@@ -453,6 +478,10 @@ The ward-to-ICU transfer excludes moves that reach the ICU through a procedural 
 
 Elixhauser comorbidities via the Quan ICD-10 algorithm, summarized by the van Walraven weighted index.
 
+#### Hospital Identification and the Declared-Hospital Check
+
+Each encounter is assigned the `hospital_id` of its first ADT row, lowercased and trimmed. After every exclusion has been applied, the set of `hospital_id` values in the cohort is compared with the `hospital_ids` list in the site configuration, and the run stops on any mismatch (see [Declaring your hospitals](#declaring-your-hospitals)). The hospital-type tally for eTable 1 (`hospital_types_<site>.csv`) is built at the same point, restricted to the declared list, so it always sums to the declared count. Each hospital receives one type by majority vote over its non-missing ADT `hospital_type` rows; a hospital whose rows are all blank is reported as `unspecified` rather than dropped.
+
 **Outputs:**
 
 | File | Description |
@@ -462,7 +491,7 @@ Elixhauser comorbidities via the Quan ICD-10 algorithm, summarized by the van Wa
 | `proj_tables/careprocess.parquet` | Vasopressor and respiratory-support events |
 | `proj_tables/hid_jid_crosswalk.parquet` | Hospitalization-ID mapping |
 | `<BOX_DIR>/cancer_codes_primary_<site>.csv` | Primary cancer-code frequencies (n > 5) |
-| `<BOX_DIR>/hospital_types_<site>.csv` | Hospital counts by type; one type per hospital by majority vote over non-missing ADT rows |
+| `<BOX_DIR>/hospital_types_<site>.csv` | Hospital counts by type over the declared hospital list; sums to the declared count |
 | `<BOX_DIR>/figure_s01_flow_<site>.csv` | Inclusion flow-diagram counts (a final row is appended in `02`) |
 
 ---
@@ -562,7 +591,9 @@ Room air:         FiO₂ = 0.21
 4. **Sensitivity analyses** — see table below.
 5. **Liquid-stratum threshold block** — Standard-threshold operating characteristics (`sesp`, `ever`) for hematologic vs. solid malignancies within the cancer cohort, for the composite and nohospice outcomes.
 
-> **The bootstrap resamples encounters, not observations.** 400 replicates draw `joined_hosp_id` values with replacement and carry every observation of a drawn encounter, weighted by its draw multiplicity, so the resampling unit matches the clustering unit and the bootstrap distribution belongs to the same point-level quantity the estimate does. Seed 2025.
+> **AUROC and DeLong intervals are computed from count tables.** Every score is an integer with at most ~21 distinct values, so the DeLong placements are constant within a value and the AUROC, its DeLong standard error, and the 95% interval are computed exactly from the `maxscores` and `counts` tables the script already writes. This replaces an observation-level `pROC` computation that ran once per (score, cohort) cell — about 220 times — and took minutes per cell at a large site. Before the artifact matrix runs, a self-check computes the encounter-max composite/ca cells both ways and stops the run if any estimate or bound differs from `pROC` by more than 1e-8. The shipped numbers are unchanged from the observation-level method to floating-point precision.
+
+> **The bootstrap resamples encounters, not observations.** 400 replicates draw `joined_hosp_id` values with replacement and carry every observation of a drawn encounter, weighted by its draw multiplicity, so the resampling unit matches the clustering unit and the bootstrap distribution belongs to the same point-level quantity the estimate does (variant `boot`, seed 2025). A companion bootstrap draws one time point per resampled encounter (variant `bootenc`, seed 2026), which removes length of stay from the weighting; it is a different estimand and is reported separately.
 
 | Variant | Description |
 |---------|-------------|
@@ -579,7 +610,7 @@ Room air:         FiO₂ = 0.21
 
 ### 03b_leadtime.R — Lead Time to Deterioration
 
-**Purpose:** Report how much warning an alert affords. For each encounter, score, and outcome, computes the hours from the first threshold-positive score to the event, exported as binned counts plus sufficient statistics (never individual intervals), together with a crossed × event classification of every encounter (`crossclass`). Positivity uses the standard thresholds with the NEWS single-parameter rule. Because the score series is truncated before the event, every crossing precedes it and lead times are strictly positive (asserted). A QC cross-check ties the crossed-and-event counts back to `03a`'s `sesp` artifact. Outcomes: composite and nohospice. Outputs in `threshold/`.
+**Purpose:** Report how much warning an alert affords. For each encounter, score, and outcome, computes the hours from the first threshold-positive score to the event, exported as binned counts plus sufficient statistics (never individual intervals), together with a crossed × event classification of every encounter (`crossclass`). Positivity uses the standard thresholds with the NEWS single-parameter rule. Because the score series is truncated before the event, every crossing precedes it and lead times are strictly positive (asserted). A QC cross-check ties the crossed-and-event counts back to `03a`'s `sesp` artifact. Exact medians are exported per health system and per `hospital_id` (`leadtime_median`); the per-hospital rows carry the `hospital_id` label as `unit_id`, which is how the coordinating center verifies each site's declared hospital list. Outcomes: composite and nohospice. Outputs in `threshold/`.
 
 ---
 
@@ -596,6 +627,12 @@ Room air:         FiO₂ = 0.21
 
 ---
 
+## Coordinating Center
+
+Sites can skip this section. `for_pooled_analysis/` holds the scripts that pool the uploaded artifacts into the manuscript's tables and figures, and `site_metadata.yaml` at the repository root holds the hand-maintained metadata for eTable 1 (health-system name, declared hospital list or count, study period, bed counts, IRB number). Neither is read by the site pipeline. The pooled run cross-checks each site's declared hospitals against the `hospital_id` labels in its lead-time artifact and names any discrepancy; eFigure 1 is drawn from the pooled flow counts in `06_figures.R`.
+
+---
+
 ## Output Artifacts
 
 All outputs follow a standardized naming convention:
@@ -604,7 +641,7 @@ All outputs follow a standardized naming convention:
 upload_to_box_v2/<family>/<artifact>[-<strata>][-<outcome>][-h<hours>][-<variant>]-<site>.csv
 ```
 
-Tokens are optional and appear only where they apply: `strata` (e.g. `ca`, `liquid`, `mets`), `outcome` (`composite`, `nohospice`, `wardicu`, `warddeath`, `hospicedc`), `hours` (`h12`, `h24`), and `variant` (e.g. `se_fullcode_only`, `cf6`, `boot`).
+Tokens are optional and appear only where they apply: `strata` (e.g. `ca`, `liquid`, `mets`), `outcome` (`composite`, `nohospice`, `wardicu`, `warddeath`, `hospicedc`), `hours` (`h12`, `h24`), and `variant` (e.g. `se_fullcode_only`, `cf6`, `boot`, `bootenc`).
 
 ### Directory Structure
 
@@ -623,10 +660,11 @@ upload_to_box_v2/
 │   ├── cuminc-<strata>-<outcome>-<site>.csv        # Cumulative incidence of positivity
 │   ├── upset-<strata>-<outcome>-<site>.csv         # Score co-positivity patterns
 │   ├── leadtime-ca-<outcome>-<site>.csv            # Lead time (binned + sufficient stats)
+│   ├── leadtime_median-ca-<outcome>-<site>.csv     # Exact medians per health system and hospital
 │   └── crossclass-ca-<outcome>-<site>.csv          # Crossed × event classification
 │
 ├── horizon/
-│   └── counts-<strata>-<outcome>-h{12,24}-<site>.csv  # Horizon prediction counts (+ bootstrap, both horizons)
+│   └── counts-<strata>-<outcome>-h{12,24}-<site>.csv  # Horizon prediction counts (+ boot / bootenc)
 │
 ├── sensitivity/
 │   ├── maxscores-<strata>-<outcome>-<variant>-<site>.csv
@@ -674,8 +712,10 @@ The AUROC floor is an **estimability** rule, not a disclosure rule: an AUROC com
 
 - Patient-level data
 - Dates of service
-- Identifiers of any kind
+- Patient or encounter identifiers of any kind
 - Raw CLIF tables
+
+Hospital identifiers (`hospital_id` labels) do leave the site, as `unit_id` in `leadtime_median`; they identify facilities, not people, and are the mechanism by which the coordinating center verifies each site's declared hospital list.
 
 ---
 
@@ -693,6 +733,9 @@ The AUROC floor is an **estimability** rule, not a disclosure rule: an AUROC com
 | `uvr sync --frozen` reports a stale lockfile | Inconsistent checkout | Run `git pull` and retry. Do **not** run plain `uvr sync` or `uvr lock` to work around this; that would re-resolve versions locally and your site would run a different package set from every other site. Contact the coordinating center |
 | `uvr sync` reports missing system libraries (Linux) | Unmet system dependency | Run the `apt-get install` line uvr prints, then retry |
 | Package compile failure (Windows) | Source fallback without a toolchain | Install [Rtools](https://cran.r-project.org/bin/windows/Rtools/); confirm with `uvr doctor` |
+| "Missing 'hospital_ids' in config_clif_oncrisk.yaml" | Config predates the key | Add `hospital_ids` to your config, copying the form from the template |
+| "Declared-hospital check failed" | Cohort `hospital_id` values differ from the declared list | Read the two lists printed above the error. Fix `hospital_id` in the ADT extract, or correct `hospital_ids` in the config, then rerun `01_cohort.R` |
+| "DeLong self-check FAILED" | Count-based AUROC disagrees with pROC on this site's data | Do not proceed; send the printed comparison table to the coordinating center |
 | "Column not found" | Schema mismatch | Check column names in CLIF tables; the resolver is case-insensitive but names must exist |
 | Arrow read errors | Corrupt or unreadable input files | Verify the files open outside R, or use `file_type: "csv"` |
 | NEWS sparse-oxygen stop | `lpm_set` and `fio2_set` present but effectively empty | Confirm with the coordinating center, then set `allow_sparse_o2: true` |
@@ -700,6 +743,7 @@ The AUROC floor is an **estimability** rule, not a disclosure rule: an AUROC com
 | `here()` cannot find root | Launched outside the repository root, or `.here` missing | Launch from the repository root; confirm `.here` is present |
 | "BOX_DIR not found" | A stage was run before `00_setup.R` | Run stages in order, or use `run_all.R` |
 | Missing intermediate parquet | A `02*`/`03*` stage run out of order | Run the earlier stage first; each stage reads the previous stage's `proj_tables/` outputs |
+| `03a` silent for many minutes | Stalled run (the matrix prints a line per outcome and the bootstraps every 50 replicates) | Check memory; rerun `03a` alone inside `uvr run` |
 | Memory errors | Insufficient RAM | Run stages individually inside `uvr run`, or restart R between stages |
 | MANIFEST QC failure | An expected artifact family is absent | A stage failed quietly; check console output for the failing stage |
 
@@ -711,6 +755,7 @@ Setup performs extensive validation. Common issues:
 2. **Invalid values** — Check categorical columns against expected domains (e.g. `location_category`, `discharge_category`, `device_category`)
 3. **Date formats** — Timestamps should parse as datetimes
 4. **Quoted booleans** — `allow_sparse_o2` must be unquoted `true` or `false`
+5. **Hospital list** — `hospital_ids` must be present, non-empty, and free of blanks and duplicates after lowercasing
 
 ### Getting Help
 
