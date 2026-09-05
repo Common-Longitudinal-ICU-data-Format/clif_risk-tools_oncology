@@ -702,7 +702,6 @@ The pipeline applies disclosure protections that differ by artifact class, becau
 
 | Artifact class | Rule |
 |----------------|------|
-| Score values, threshold counts, horizon counts, co-positivity (`upset`) counts | No suppression |
 | AUROC | Estimability floor: computed only when there are at least 10 events **and** at least 10 non-events; otherwise returned as `NA` with `n_obs`, `n_events`, and an `estimable = FALSE` flag retained |
 | Diagnosis-code tallies (cancer codes, admission diagnoses by chapter and stem) | Cells with n ≤ 5 are dropped |
 
