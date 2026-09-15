@@ -389,9 +389,10 @@ ca_codes =
   fsubset(!str_detect(icd_10_cm_code_definition, "in remission|personal history")) |>
   fsubset(!icd_10_cm_code_specific %in% additional_drops) |>
   fmutate(liquid_01 = if_else(general_category == "Hematopoietic neoplasm", 1L, 0L)) |>
-  fselect(diagnosis_code = icd_10_cm_code_specific, liquid_01)
+  fselect(diagnosis_code = icd_10_cm_code_specific, liquid_01) |>
+  fmutate(diagnosis_code = toupper(trimws(diagnosis_code)))
 
-ca_vect  = funique(toupper(ca_codes$diagnosis_code))
+ca_vect  = funique(ca_codes$diagnosis_code)
 
 ### pull all cancer codes from arrow table -------------------------------------
 
@@ -401,6 +402,11 @@ dx =
   dplyr::select(hospitalization_id, poa_present, diagnosis_code) |>
   dplyr::collect()
 
+# Normalize once here: the hierarchy patterns below are uppercase-only regexes
+# and the join to ca_codes is exact, so a site that stores lowercase codes
+# (e.g., "c90.00") would otherwise rank every code as "Other" and receive
+# liquid_01 = NA -> 0 for every encounter.
+dx = fmutate(dx, diagnosis_code = toupper(trimws(diagnosis_code)))
 dx = distinct(dx)
 
 ### assign hierarchy to diagnoses ----------------------------------------------
