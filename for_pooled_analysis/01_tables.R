@@ -145,6 +145,10 @@ cat_data[var == "initial_code_status" & category %in% c("other", "special/partia
          category := "Other"]
 cat_data[var == "initial_code_status" & tolower(category) == "full",
          category := "Full"]
+cat_data[var == "initial_code_status" & tolower(category) %in% c("full code", "full_code"),
+         category := "Full"]
+cat_data[var == "initial_code_status" & tolower(category) %in% c("dni_only", "dni only", "dni"),
+         category := "Other"]
 cat_data[var == "race_category" & category %in% c("other", "unknown", "two or more races"),
          category := "Other/Unknown"]
 

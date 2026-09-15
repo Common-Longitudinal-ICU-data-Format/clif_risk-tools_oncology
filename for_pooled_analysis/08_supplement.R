@@ -217,7 +217,7 @@ total_hospitals     = NA_integer_
 
 ## 1. site metadata --------------------------------------------------------------
 
-meta_file = here("site_metadata.yaml")
+meta_file = here("config/site_metadata.yaml")
 site_meta = data.table()
 declared  = data.table()
 
@@ -462,10 +462,10 @@ if (nrow(hospital_counts) > 0 || nrow(ht_wide) > 0) {
     health_system        = "Health system",
     date_range           = "Study period",
     hospitals_total      = "Hospitals, n",
-    academic             = "Academic",
-    community            = "Community",
-    LTACH                = "Long-term acute care",
-    unspecified          = "Type unspecified",
+    academic             = "Academic (ADT)",
+    community            = "Community (ADT)",
+    LTACH                = "Long-term acute care (ADT)",
+    unspecified          = "Type unspecified (ADT)",
     hospitalizations     = "Hospitalizations, n",
     adult_inpatient_beds = "Adult inpatient beds, n",
     adult_icu_beds       = "Adult ICU beds, n",
@@ -477,9 +477,11 @@ if (nrow(hospital_counts) > 0 || nrow(ht_wide) > 0) {
   save_supplement(
     hospital_type_table, "table_s_hospital_types", "eTable 1",
     footnote = paste0(
-      "Hospitals, n counts hospitals contributing encounters to the analytic cohort. ",
-      "Hospital type is the majority-vote classification of each hospital in the ",
-      "site's admission-discharge-transfer table. Hospitalizations, n is the final ",
+      "Hospitals, n is the number of hospitals each health system declared to the ",
+      "coordinating center. Columns marked ADT count hospitals by the majority-vote ",
+      "type classification in the health system's admission-discharge-transfer table; ",
+      "this tally can include hospitals that contributed no cohort encounters and ",
+      "therefore can differ from Hospitals, n. Hospitalizations, n is the final ",
       "analytic cohort (emergency-department admissions to a ward) at each health system."
     )
   )

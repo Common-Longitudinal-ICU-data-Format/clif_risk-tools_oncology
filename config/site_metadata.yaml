@@ -18,7 +18,7 @@
 
 emory:
   health_system: "Emory University"
-  n_hospitals: 9
+  n_hospitals: 8
   date_range: "2016-2024"
   adult_inpatient_beds: 1959
   adult_icu_beds: 308
